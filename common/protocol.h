@@ -27,6 +27,15 @@ enum class MsgType : uint8_t {
                                 // Server→Subscribers: sharer_id(4)+opus_data
 
     UPDATE_AVAILABLE   = 0x0D,  // Server→Client: version\0url\0
+
+    // Voice channel (separate from text chat)
+    VOICE_JOIN     = 0x0E,  // Client→Server: empty payload
+    VOICE_LEAVE    = 0x0F,  // Client→Server: empty payload
+    VOICE_JOINED   = 0x10,  // Server→All: client_id(4)
+    VOICE_LEFT     = 0x11,  // Server→All: client_id(4)
+
+    // Chat sync (persistent chat)
+    CHAT_SYNC      = 0x12,  // Client→Server: last_known_seq(8)
 };
 
 // ── TCP signal header: [msg_type:1][payload_len:4] = 5 bytes ──
@@ -151,6 +160,35 @@ inline uint32_t read_u32(const uint8_t* data) {
 inline uint16_t read_u16(const uint8_t* data) {
     return static_cast<uint16_t>(data[0]) |
            (static_cast<uint16_t>(data[1]) << 8);
+}
+
+inline uint64_t read_u64(const uint8_t* data) {
+    return static_cast<uint64_t>(data[0])        |
+           (static_cast<uint64_t>(data[1]) << 8)  |
+           (static_cast<uint64_t>(data[2]) << 16) |
+           (static_cast<uint64_t>(data[3]) << 24) |
+           (static_cast<uint64_t>(data[4]) << 32) |
+           (static_cast<uint64_t>(data[5]) << 40) |
+           (static_cast<uint64_t>(data[6]) << 48) |
+           (static_cast<uint64_t>(data[7]) << 56);
+}
+
+inline void write_u64(std::vector<uint8_t>& buf, uint64_t val) {
+    buf.push_back(static_cast<uint8_t>(val & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 16) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 24) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 32) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 40) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 48) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 56) & 0xFF));
+}
+
+inline void write_u32(std::vector<uint8_t>& buf, uint32_t val) {
+    buf.push_back(static_cast<uint8_t>(val & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 8) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 16) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((val >> 24) & 0xFF));
 }
 
 // ── UDP voice packet: [client_id:4][sequence:4][opus_data:variable] ──
@@ -300,6 +338,64 @@ inline std::vector<uint8_t> make_screen_audio_relay(uint32_t sharer_id,
     buf.push_back(static_cast<uint8_t>((sharer_id >> 16) & 0xFF));
     buf.push_back(static_cast<uint8_t>((sharer_id >> 24) & 0xFF));
     buf.insert(buf.end(), opus_data, opus_data + opus_len);
+    return buf;
+}
+
+// ── Voice channel message helpers ──
+
+// Client→Server: empty payload
+inline std::vector<uint8_t> make_voice_join_msg() {
+    SignalHeader h{MsgType::VOICE_JOIN, 0};
+    return serialize_header(h);
+}
+
+// Client→Server: empty payload
+inline std::vector<uint8_t> make_voice_leave_msg() {
+    SignalHeader h{MsgType::VOICE_LEAVE, 0};
+    return serialize_header(h);
+}
+
+// Server→All: client_id(4)
+inline std::vector<uint8_t> make_voice_joined_broadcast(uint32_t client_id) {
+    SignalHeader h{MsgType::VOICE_JOINED, 4};
+    auto buf = serialize_header(h);
+    write_u32(buf, client_id);
+    return buf;
+}
+
+// Server→All: client_id(4)
+inline std::vector<uint8_t> make_voice_left_broadcast(uint32_t client_id) {
+    SignalHeader h{MsgType::VOICE_LEFT, 4};
+    auto buf = serialize_header(h);
+    write_u32(buf, client_id);
+    return buf;
+}
+
+// Client→Server: last_known_seq(8)
+inline std::vector<uint8_t> make_chat_sync_msg(uint64_t last_seq) {
+    SignalHeader h{MsgType::CHAT_SYNC, 8};
+    auto buf = serialize_header(h);
+    write_u64(buf, last_seq);
+    return buf;
+}
+
+// Server→All (v2): seq(8) + client_id(4) + timestamp(8) + sender_name\0 + text\0
+inline std::vector<uint8_t> make_text_chat_broadcast_v2(uint64_t seq, uint32_t client_id,
+                                                         int64_t timestamp,
+                                                         const std::string& sender_name,
+                                                         const std::string& text) {
+    std::string t = text.substr(0, MAX_CHAT_LEN);
+    std::string name = sender_name.substr(0, MAX_USERNAME_LEN);
+    uint32_t len = static_cast<uint32_t>(8 + 4 + 8 + name.size() + 1 + t.size() + 1);
+    SignalHeader h{MsgType::TEXT_CHAT, len};
+    auto buf = serialize_header(h);
+    write_u64(buf, seq);
+    write_u32(buf, client_id);
+    write_u64(buf, static_cast<uint64_t>(timestamp));
+    buf.insert(buf.end(), name.begin(), name.end());
+    buf.push_back('\0');
+    buf.insert(buf.end(), t.begin(), t.end());
+    buf.push_back('\0');
     return buf;
 }
 

@@ -4,6 +4,7 @@
 
 #include "audio.h"
 #include "audio_codec.h"
+#include "chat_persistence.h"
 #include "network.h"
 #include "protocol.h"
 #include "screen_capture.h"
@@ -38,7 +39,7 @@
 #include <vector>
 
 // ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.3";
+static constexpr const char* APP_VERSION = "1.0.4";
 
 // ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
 static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";
@@ -202,6 +203,7 @@ struct UserEntry {
     uint32_t    id;
     std::string name;
     bool        is_sharing = false;
+    bool        in_voice = false;
 };
 
 struct ChatMessage {
@@ -209,6 +211,8 @@ struct ChatMessage {
     std::string sender_name;
     std::string text;
     bool        is_system;
+    uint64_t    seq = 0;
+    int64_t     timestamp = 0;
 };
 
 // Per-user jitter buffer for voice reception
@@ -225,12 +229,52 @@ struct ScreenSendItem {
     bool                 is_audio; // true = SCREEN_AUDIO, false = SCREEN_FRAME
 };
 
+// ── Chat cache helpers ──
+static std::string get_lilypad_dir() {
+    PWSTR documents = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, documents, -1, nullptr, 0, nullptr, nullptr);
+        std::string path(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, documents, -1, path.data(), len, nullptr, nullptr);
+        CoTaskMemFree(documents);
+        path += "\\LilyPad";
+        CreateDirectoryA(path.c_str(), nullptr);
+        return path;
+    }
+    return "";
+}
+
+static std::string get_chat_cache_dir(const std::string& server_ip) {
+    std::string base = get_lilypad_dir();
+    if (base.empty()) return "";
+    std::string cache_dir = base + "\\cache";
+    CreateDirectoryA(cache_dir.c_str(), nullptr);
+    // Sanitize IP for directory name (replace : with _)
+    std::string safe_ip = server_ip;
+    for (char& c : safe_ip) {
+        if (c == ':' || c == '/' || c == '\\') c = '_';
+    }
+    std::string server_dir = cache_dir + "\\" + safe_ip;
+    CreateDirectoryA(server_dir.c_str(), nullptr);
+    return server_dir;
+}
+
+static std::string get_chat_cache_path(const std::string& server_ip) {
+    std::string dir = get_chat_cache_dir(server_ip);
+    if (dir.empty()) return "";
+    return dir + "\\chat.jsonl";
+}
+
 struct AppState {
     // Connection
     std::atomic<bool> connected{false};
     std::atomic<bool> running{true};
     uint32_t          my_id = 0;
     std::string       my_username;
+    std::string       server_ip;
+
+    // Voice channel (separate from text chat)
+    std::atomic<bool> in_voice{false};
 
     // Update notification (from server or background GitHub check)
     std::mutex              update_mutex;
@@ -250,6 +294,7 @@ struct AppState {
     // Chat messages
     std::mutex              chat_mutex;
     std::vector<ChatMessage> chat_messages;
+    std::atomic<uint64_t>   last_known_seq{0};
 
     // Per-user volume (client_id → volume 0.0-2.0, default 1.0)
     std::mutex                           volume_mutex;
@@ -328,15 +373,16 @@ struct AppState {
 
     void add_system_msg(const std::string& text) {
         std::lock_guard<std::mutex> lk(chat_mutex);
-        chat_messages.push_back({0, "", text, true});
-        if (chat_messages.size() > 500)
+        chat_messages.push_back({0, "", text, true, 0, 0});
+        if (chat_messages.size() > 5000)
             chat_messages.erase(chat_messages.begin());
     }
 
-    void add_chat_msg(uint32_t sender_id, const std::string& name, const std::string& text) {
+    void add_chat_msg(uint32_t sender_id, const std::string& name, const std::string& text,
+                      uint64_t seq = 0, int64_t timestamp = 0) {
         std::lock_guard<std::mutex> lk(chat_mutex);
-        chat_messages.push_back({sender_id, name, text, false});
-        if (chat_messages.size() > 500)
+        chat_messages.push_back({sender_id, name, text, false, seq, timestamp});
+        if (chat_messages.size() > 5000)
             chat_messages.erase(chat_messages.begin());
     }
 
@@ -659,12 +705,51 @@ static void tcp_receive_thread(AppState& app) {
             break;
         }
         case lilypad::MsgType::TEXT_CHAT: {
-            if (payload.size() > 4) {
+            // v2 format: seq(8) + client_id(4) + timestamp(8) + sender_name\0 + text\0
+            if (payload.size() > 20) {
+                uint64_t seq = lilypad::read_u64(payload.data());
+                uint32_t uid = lilypad::read_u32(payload.data() + 8);
+                int64_t ts   = static_cast<int64_t>(lilypad::read_u64(payload.data() + 12));
+                // Find sender_name (null-terminated starting at offset 20)
+                const char* p = reinterpret_cast<const char*>(payload.data() + 20);
+                std::string sender_name(p);
+                size_t text_offset = 20 + sender_name.size() + 1;
+                std::string text;
+                if (text_offset < payload.size()) {
+                    text = std::string(reinterpret_cast<const char*>(payload.data() + text_offset));
+                }
+                // Skip if already in cache
+                if (seq <= app.last_known_seq.load()) break;
+                app.add_chat_msg(uid, sender_name, text, seq, ts);
+                app.last_known_seq = seq;
+                // Append to local cache
+                std::string cache_path = get_chat_cache_path(app.server_ip);
+                if (!cache_path.empty()) {
+                    std::ofstream cf(cache_path, std::ios::app);
+                    if (cf.is_open()) {
+                        cf << lilypad::serialize_chat_line(seq, sender_name, ts, text) << '\n';
+                    }
+                }
+            }
+            break;
+        }
+        case lilypad::MsgType::VOICE_JOINED: {
+            if (payload.size() >= 4) {
                 uint32_t uid = lilypad::read_u32(payload.data());
-                std::string text(reinterpret_cast<const char*>(payload.data() + 4));
-                std::string name = app.lookup_username(uid);
-                if (uid == app.my_id) name = app.my_username;
-                app.add_chat_msg(uid, name, text);
+                std::lock_guard<std::mutex> lk(app.users_mutex);
+                for (auto& u : app.users) {
+                    if (u.id == uid) { u.in_voice = true; break; }
+                }
+            }
+            break;
+        }
+        case lilypad::MsgType::VOICE_LEFT: {
+            if (payload.size() >= 4) {
+                uint32_t uid = lilypad::read_u32(payload.data());
+                std::lock_guard<std::mutex> lk(app.users_mutex);
+                for (auto& u : app.users) {
+                    if (u.id == uid) { u.in_voice = false; break; }
+                }
             }
             break;
         }
@@ -771,7 +856,7 @@ static void voice_send_thread(AppState& app) {
     DenoiseState* rnn_st = rnnoise_create(nullptr);
     const int rnn_frame = 480; // rnnoise processes 480 samples at a time
 
-    while (app.running && app.connected) {
+    while (app.running && app.connected && app.in_voice) {
         try {
             auto pcm = app.capture->read_frame();
 
@@ -830,7 +915,7 @@ static void udp_receive_thread_func(AppState& app) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     uint8_t buf[lilypad::MAX_VOICE_PACKET];
 
-    while (app.running && app.connected) {
+    while (app.running && app.connected && app.in_voice) {
         fd_set read_set;
         FD_ZERO(&read_set);
         FD_SET(app.udp->get(), &read_set);
@@ -887,7 +972,7 @@ static void audio_playback_thread_func(AppState& app) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     const size_t frame_len = lilypad::FRAME_SIZE * lilypad::CHANNELS;
 
-    while (app.running && app.connected) {
+    while (app.running && app.connected && app.in_voice) {
         std::vector<float> mixed(frame_len, 0.0f);
 
         {
@@ -957,8 +1042,11 @@ static void audio_playback_thread_func(AppState& app) {
 //  Connect / Disconnect
 // ════════════════════════════════════════════════════════════════
 
-static void do_connect(AppState& app, const std::string& server_ip, const std::string& username,
-                       int input_device, int output_device) {
+// Forward declarations for voice join/leave
+static void do_join_voice(AppState& app, int input_device, int output_device);
+static void do_leave_voice(AppState& app);
+
+static void do_connect(AppState& app, const std::string& server_ip, const std::string& username) {
     try {
         auto tcp = std::make_unique<lilypad::Socket>(lilypad::create_tcp_socket());
 
@@ -1013,18 +1101,13 @@ static void do_connect(AppState& app, const std::string& server_ip, const std::s
         udp_dest.sin_port   = htons(udp_port);
         inet_pton(AF_INET, server_ip.c_str(), &udp_dest.sin_addr);
 
-        auto capture  = std::make_unique<lilypad::AudioCapture>(
-            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, input_device);
-        auto playback = std::make_unique<lilypad::AudioPlayback>(
-            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, output_device);
-
         app.tcp      = std::move(tcp);
         app.udp      = std::move(udp);
         app.udp_dest = udp_dest;
         app.my_id    = my_id;
         app.my_username = username;
-        app.capture  = std::move(capture);
-        app.playback = std::move(playback);
+        app.server_ip = server_ip;
+        app.in_voice = false;
 
         {
             std::lock_guard<std::mutex> lk(app.users_mutex);
@@ -1051,13 +1134,35 @@ static void do_connect(AppState& app, const std::string& server_ip, const std::s
             app.screen_jpeg_new = false;
         }
 
+        // Load chat cache from disk
+        app.last_known_seq = 0;
+        {
+            std::lock_guard<std::mutex> lk(app.chat_mutex);
+            app.chat_messages.clear();
+        }
+        std::string cache_path = get_chat_cache_path(server_ip);
+        if (!cache_path.empty()) {
+            std::ifstream cf(cache_path);
+            std::string line;
+            while (std::getline(cf, line)) {
+                if (line.empty()) continue;
+                auto entry = lilypad::parse_chat_line(line);
+                if (!entry.valid) continue;
+                app.add_chat_msg(0, entry.sender, entry.text, entry.seq, entry.timestamp);
+                if (entry.seq > app.last_known_seq.load())
+                    app.last_known_seq = entry.seq;
+            }
+        }
+
         app.connected = true;
         app.add_system_msg("Connected! Your ID: " + std::to_string(my_id));
 
-        app.tcp_thread     = std::make_unique<std::thread>(tcp_receive_thread, std::ref(app));
-        app.send_thread    = std::make_unique<std::thread>(voice_send_thread, std::ref(app));
-        app.udp_recv_thread    = std::make_unique<std::thread>(udp_receive_thread_func, std::ref(app));
-        app.playback_thread    = std::make_unique<std::thread>(audio_playback_thread_func, std::ref(app));
+        // Send CHAT_SYNC to get messages newer than our cache
+        auto sync_msg = lilypad::make_chat_sync_msg(app.last_known_seq.load());
+        app.send_tcp(sync_msg);
+
+        // Start TCP receive and screen decode threads only (voice threads start on Join Voice)
+        app.tcp_thread = std::make_unique<std::thread>(tcp_receive_thread, std::ref(app));
         app.screen_decode_thread = std::make_unique<std::thread>(screen_decode_thread_func, std::ref(app));
 
     } catch (const std::exception& e) {
@@ -1065,8 +1170,73 @@ static void do_connect(AppState& app, const std::string& server_ip, const std::s
     }
 }
 
+static void do_join_voice(AppState& app, int input_device, int output_device) {
+    if (!app.connected || app.in_voice) return;
+    try {
+        app.capture = std::make_unique<lilypad::AudioCapture>(
+            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, input_device);
+        app.playback = std::make_unique<lilypad::AudioPlayback>(
+            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, output_device);
+
+        app.in_voice = true;
+        app.send_tcp(lilypad::make_voice_join_msg());
+
+        app.send_thread     = std::make_unique<std::thread>(voice_send_thread, std::ref(app));
+        app.udp_recv_thread = std::make_unique<std::thread>(udp_receive_thread_func, std::ref(app));
+        app.playback_thread = std::make_unique<std::thread>(audio_playback_thread_func, std::ref(app));
+    } catch (const std::exception& e) {
+        app.in_voice = false;
+        app.add_system_msg(std::string("Failed to join voice: ") + e.what());
+    }
+}
+
+static void do_leave_voice(AppState& app) {
+    if (!app.in_voice) return;
+
+    app.in_voice = false;
+    if (app.connected) {
+        app.send_tcp(lilypad::make_voice_leave_msg());
+    }
+
+    // Close UDP to unblock recv thread, then join voice threads
+    if (app.udp) app.udp->close();
+
+    if (app.send_thread && app.send_thread->joinable()) app.send_thread->join();
+    if (app.udp_recv_thread && app.udp_recv_thread->joinable()) app.udp_recv_thread->join();
+    if (app.playback_thread && app.playback_thread->joinable()) app.playback_thread->join();
+
+    app.send_thread.reset();
+    app.udp_recv_thread.reset();
+    app.playback_thread.reset();
+    app.capture.reset();
+    app.playback.reset();
+
+    // Clear jitter buffers
+    {
+        std::lock_guard<std::mutex> lk(app.jitter_mutex);
+        app.jitter_buffers.clear();
+        app.voice_decoders.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(app.voice_activity_mutex);
+        app.voice_last_seen.clear();
+    }
+
+    // Recreate UDP socket for potential rejoin
+    if (app.connected) {
+        try {
+            app.udp = std::make_unique<lilypad::Socket>(lilypad::create_udp_socket());
+        } catch (...) {}
+    }
+}
+
 static void do_disconnect(AppState& app) {
     if (!app.connected) return;
+
+    // Leave voice if active
+    if (app.in_voice) {
+        do_leave_voice(app);
+    }
 
     // Stop screen sharing if active
     app.screen_sharing = false;
@@ -1085,24 +1255,16 @@ static void do_disconnect(AppState& app) {
     if (app.udp) app.udp->close();
 
     if (app.tcp_thread  && app.tcp_thread->joinable())  app.tcp_thread->join();
-    if (app.send_thread && app.send_thread->joinable()) app.send_thread->join();
-    if (app.udp_recv_thread && app.udp_recv_thread->joinable()) app.udp_recv_thread->join();
-    if (app.playback_thread && app.playback_thread->joinable()) app.playback_thread->join();
     if (app.screen_thread && app.screen_thread->joinable()) app.screen_thread->join();
     if (app.sys_audio_thread && app.sys_audio_thread->joinable()) app.sys_audio_thread->join();
     if (app.screen_send_thread && app.screen_send_thread->joinable()) app.screen_send_thread->join();
     if (app.screen_decode_thread && app.screen_decode_thread->joinable()) app.screen_decode_thread->join();
 
     app.tcp_thread.reset();
-    app.send_thread.reset();
-    app.udp_recv_thread.reset();
-    app.playback_thread.reset();
     app.screen_thread.reset();
     app.sys_audio_thread.reset();
     app.screen_send_thread.reset();
     app.screen_decode_thread.reset();
-    app.capture.reset();
-    app.playback.reset();
     app.tcp.reset();
     app.udp.reset();
 
@@ -1419,8 +1581,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::SameLine();
             ImGui::TextDisabled("Voice Chat");
 
-            // Status indicator on the right
-            if (app.connected) {
+            // Status indicator on the right (only when in voice)
+            if (app.connected && app.in_voice) {
                 ImGui::SameLine(ImGui::GetWindowWidth() - 140);
                 if (app.muted) {
                     ImGui::TextColored(ImVec4(0.72f, 0.28f, 0.28f, 1.0f), "[MUTED]");
@@ -1610,11 +1772,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 app.ptt_enabled = ptt_enabled;
                 app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
                 app.noise_suppression = noise_suppression;
-                int in_dev  = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
-                    ? input_devices[selected_input].index : -1;
-                int out_dev = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
-                    ? output_devices[selected_output].index : -1;
-                do_connect(app, ip_buf, username_buf, in_dev, out_dev);
+                do_connect(app, ip_buf, username_buf);
             }
             ImGui::PopStyleColor(3);
 
@@ -1626,54 +1784,125 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
             ImGui::Spacing();
 
-            // Mute button
-            {
-                bool is_muted = app.muted.load();
-                if (is_muted) {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
-                } else {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
+            bool is_in_voice = app.in_voice.load();
+
+            // Audio device selection (visible when NOT in voice, for choosing before joining)
+            if (!is_in_voice) {
+                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Audio Devices");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Input");
+                ImGui::SetNextItemWidth(-1);
+                const char* in_preview = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
+                    ? input_devices[selected_input].name.c_str() : "Default";
+                if (ImGui::BeginCombo("##in_dev_conn", in_preview)) {
+                    for (int i = 0; i < static_cast<int>(input_devices.size()); ++i) {
+                        bool sel = (selected_input == i);
+                        if (ImGui::Selectable(input_devices[i].name.c_str(), sel))
+                            selected_input = i;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
                 }
-                if (ImGui::Button(is_muted ? "Unmute" : "Mute", ImVec2(-1, 30))) {
-                    app.muted = !is_muted;
+
+                ImGui::Spacing();
+                ImGui::Text("Output");
+                ImGui::SetNextItemWidth(-1);
+                const char* out_preview = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
+                    ? output_devices[selected_output].name.c_str() : "Default";
+                if (ImGui::BeginCombo("##out_dev_conn", out_preview)) {
+                    for (int i = 0; i < static_cast<int>(output_devices.size()); ++i) {
+                        bool sel = (selected_output == i);
+                        if (ImGui::Selectable(output_devices[i].name.c_str(), sel))
+                            selected_output = i;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ImGui::Spacing();
+            }
+
+            // Join / Leave Voice button
+            if (is_in_voice) {
+                // Leave Voice (red)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+                if (ImGui::Button("Leave Voice", ImVec2(-1, 30))) {
+                    do_leave_voice(app);
+                }
+                ImGui::PopStyleColor(3);
+            } else {
+                // Join Voice (green)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
+                if (ImGui::Button("Join Voice", ImVec2(-1, 30))) {
+                    app.ptt_enabled = ptt_enabled;
+                    app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
+                    app.noise_suppression = noise_suppression;
+                    int in_dev  = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
+                        ? input_devices[selected_input].index : -1;
+                    int out_dev = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
+                        ? output_devices[selected_output].index : -1;
+                    do_join_voice(app, in_dev, out_dev);
                 }
                 ImGui::PopStyleColor(3);
             }
 
             ImGui::Spacing();
-            ImGui::Spacing();
 
-            // Voice mode toggle (live)
-            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Mode");
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            if (ImGui::Checkbox("Push-to-Talk##live", &ptt_enabled)) {
-                app.ptt_enabled = ptt_enabled;
-            }
-            if (ptt_enabled) {
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(90);
-                if (ImGui::BeginCombo("##ptt_key_live", g_ptt_keys[ptt_key_sel].name)) {
-                    for (int i = 0; i < g_ptt_key_count; ++i) {
-                        bool sel = (ptt_key_sel == i);
-                        if (ImGui::Selectable(g_ptt_keys[i].name, sel)) {
-                            ptt_key_sel = i;
-                            app.ptt_key = g_ptt_keys[i].vk;
-                        }
-                        if (sel) ImGui::SetItemDefaultFocus();
+            // Mute button and voice settings (only when in voice)
+            if (is_in_voice) {
+                {
+                    bool is_muted = app.muted.load();
+                    if (is_muted) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
                     }
-                    ImGui::EndCombo();
+                    if (ImGui::Button(is_muted ? "Unmute" : "Mute", ImVec2(-1, 30))) {
+                        app.muted = !is_muted;
+                    }
+                    ImGui::PopStyleColor(3);
                 }
-            }
 
-            ImGui::Spacing();
-            if (ImGui::Checkbox("Noise Suppression##live", &noise_suppression)) {
-                app.noise_suppression = noise_suppression;
+                ImGui::Spacing();
+
+                // Voice mode toggle (live)
+                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Mode");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                if (ImGui::Checkbox("Push-to-Talk##live", &ptt_enabled)) {
+                    app.ptt_enabled = ptt_enabled;
+                }
+                if (ptt_enabled) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(90);
+                    if (ImGui::BeginCombo("##ptt_key_live", g_ptt_keys[ptt_key_sel].name)) {
+                        for (int i = 0; i < g_ptt_key_count; ++i) {
+                            bool sel = (ptt_key_sel == i);
+                            if (ImGui::Selectable(g_ptt_keys[i].name, sel)) {
+                                ptt_key_sel = i;
+                                app.ptt_key = g_ptt_keys[i].vk;
+                            }
+                            if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                ImGui::Spacing();
+                if (ImGui::Checkbox("Noise Suppression##live", &noise_suppression)) {
+                    app.noise_suppression = noise_suppression;
+                }
             }
 
             ImGui::Spacing();
@@ -1757,20 +1986,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Spacing();
             ImGui::Spacing();
 
-            // User list with right-click volume popup
-            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Users Online");
-            ImGui::Separator();
-            ImGui::Spacing();
-
+            // User list — grouped by voice channel / text chat
             {
                 std::lock_guard<std::mutex> lk(app.users_mutex);
-                if (app.users.empty()) {
-                    ImGui::TextDisabled("No other users.");
-                } else {
-                    for (auto& u : app.users) {
-                        ImGui::PushID(static_cast<int>(u.id));
 
-                        // User row — talking indicator
+                // Lambda to render a user entry
+                auto render_user = [&](const UserEntry& u, bool show_voice_indicator) {
+                    ImGui::PushID(static_cast<int>(u.id));
+
+                    if (show_voice_indicator) {
+                        // Talking indicator (only for voice users)
                         bool is_talking = false;
                         {
                             std::lock_guard<std::mutex> va_lk(app.voice_activity_mutex);
@@ -1790,46 +2015,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             dot_color = ImVec4(0.35f, 0.35f, 0.38f, 1.0f); // idle (gray)
                         }
                         ImGui::TextColored(dot_color, "  *");
-                        ImGui::SameLine();
-                        ImGui::Text("%s", u.name.c_str());
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("(#%u)", u.id);
+                    } else {
+                        // Online dot (text-only users)
+                        ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "  *");
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s", u.name.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(#%u)", u.id);
 
-                        // Screen sharing Watch/Stop button
-                        if (u.is_sharing) {
-                            ImGui::SameLine();
-                            uint32_t watching = app.watching_user_id.load();
-                            if (watching == u.id) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
-                                if (ImGui::SmallButton("Stop")) {
-                                    app.send_tcp(lilypad::make_screen_unsubscribe_msg(u.id));
-                                    app.watching_user_id = 0;
-                                }
-                                ImGui::PopStyleColor(3);
-                            } else {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.40f, 0.55f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.52f, 0.70f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.33f, 0.60f, 0.80f, 1.0f));
-                                if (ImGui::SmallButton("Watch")) {
-                                    // Unsubscribe from previous if any
-                                    if (watching != 0) {
-                                        app.send_tcp(lilypad::make_screen_unsubscribe_msg(watching));
-                                    }
-                                    app.watching_user_id = u.id;
-                                    app.send_tcp(lilypad::make_screen_subscribe_msg(u.id));
-                                }
-                                ImGui::PopStyleColor(3);
+                    // Screen sharing Watch/Stop button
+                    if (u.is_sharing) {
+                        ImGui::SameLine();
+                        uint32_t watching = app.watching_user_id.load();
+                        if (watching == u.id) {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+                            if (ImGui::SmallButton("Stop")) {
+                                app.send_tcp(lilypad::make_screen_unsubscribe_msg(u.id));
+                                app.watching_user_id = 0;
                             }
+                            ImGui::PopStyleColor(3);
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.40f, 0.55f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.28f, 0.52f, 0.70f, 1.0f));
+                            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.33f, 0.60f, 0.80f, 1.0f));
+                            if (ImGui::SmallButton("Watch")) {
+                                if (watching != 0) {
+                                    app.send_tcp(lilypad::make_screen_unsubscribe_msg(watching));
+                                }
+                                app.watching_user_id = u.id;
+                                app.send_tcp(lilypad::make_screen_subscribe_msg(u.id));
+                            }
+                            ImGui::PopStyleColor(3);
                         }
+                    }
 
-                        // Right-click context menu
+                    // Right-click context menu for volume
+                    if (show_voice_indicator) {
                         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
                             ImGui::OpenPopup("##vol_popup");
                         }
-
                         if (ImGui::BeginPopup("##vol_popup")) {
+                            float vol = app.get_volume(u.id);
                             ImGui::Text("Volume: %s", u.name.c_str());
                             ImGui::Separator();
                             float vol_pct = vol * 100.0f;
@@ -1843,9 +2072,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             }
                             ImGui::EndPopup();
                         }
-
-                        ImGui::PopID();
                     }
+
+                    ImGui::PopID();
+                };
+
+                // Voice Channel group
+                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Channel");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                bool any_voice = false;
+                for (auto& u : app.users) {
+                    if (u.in_voice) {
+                        render_user(u, true);
+                        any_voice = true;
+                    }
+                }
+                if (!any_voice) {
+                    ImGui::TextDisabled("  No users in voice.");
+                }
+
+                ImGui::Spacing();
+                ImGui::Spacing();
+
+                // Text Chat group
+                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Text Chat");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                bool any_text = false;
+                for (auto& u : app.users) {
+                    if (!u.in_voice) {
+                        render_user(u, false);
+                        any_text = true;
+                    }
+                }
+                if (!any_text) {
+                    ImGui::TextDisabled("  No text-only users.");
                 }
             }
 

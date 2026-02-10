@@ -1,7 +1,9 @@
+#include "chat_persistence.h"
 #include "network.h"
 #include "protocol.h"
 
 #include <atomic>
+#include <ctime>
 #include <condition_variable>
 #include <csignal>
 #include <deque>
@@ -32,6 +34,9 @@ struct ClientInfo {
     sockaddr_in        udp_addr;    // filled in when first UDP packet arrives
     bool               udp_known = false;
 
+    // Voice channel
+    bool               in_voice = false;
+
     // Screen sharing
     bool                             screen_sharing = false;
     std::unordered_set<uint32_t>     screen_subscribers; // IDs of clients watching this user
@@ -41,13 +46,46 @@ static std::mutex                                   g_clients_mutex;
 static std::unordered_map<uint32_t, ClientInfo>     g_clients;
 static uint32_t                                     g_next_id = 1;
 
-// ── Chat history (persists for the lifetime of the server) ──
+// ── Chat history (persistent across restarts via chat_history.jsonl) ──
 struct ChatEntry {
-    uint32_t    sender_id;
+    uint64_t    seq;
+    std::string sender_name;
+    int64_t     timestamp;
     std::string text;
 };
 static std::mutex                g_chat_mutex;
 static std::vector<ChatEntry>    g_chat_history;
+static uint64_t                  g_next_seq = 1;
+static const char*               CHAT_HISTORY_FILE = "chat_history.jsonl";
+
+static void load_chat_history() {
+    std::ifstream file(CHAT_HISTORY_FILE);
+    if (!file.is_open()) return;
+    std::string line;
+    uint64_t max_seq = 0;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        auto entry = lilypad::parse_chat_line(line);
+        if (!entry.valid) continue;
+        ChatEntry ce;
+        ce.seq         = entry.seq;
+        ce.sender_name = entry.sender;
+        ce.timestamp   = entry.timestamp;
+        ce.text        = entry.text;
+        g_chat_history.push_back(std::move(ce));
+        if (entry.seq > max_seq) max_seq = entry.seq;
+    }
+    g_next_seq = max_seq + 1;
+    std::cout << "[Server] Loaded " << g_chat_history.size() << " chat messages (next seq=" << g_next_seq << ")\n";
+}
+
+static void append_chat_to_file(const ChatEntry& entry) {
+    std::ofstream file(CHAT_HISTORY_FILE, std::ios::app);
+    if (file.is_open()) {
+        file << lilypad::serialize_chat_line(entry.seq, entry.sender_name, entry.timestamp, entry.text) << '\n';
+        file.flush();
+    }
+}
 
 // ── Update notification (loaded from update.txt next to the server executable) ──
 // File format: line 1 = version, line 2 = download URL
@@ -115,6 +153,15 @@ static void remove_client(uint32_t client_id) {
         auto it = g_clients.find(client_id);
         if (it == g_clients.end()) return;
         name = it->second.username;
+
+        // If this client was in voice, broadcast VOICE_LEFT
+        if (it->second.in_voice) {
+            auto voice_left = lilypad::make_voice_left_broadcast(client_id);
+            for (auto& [id, c] : g_clients) {
+                if (id != client_id)
+                    c.tcp_socket.send_all(voice_left);
+            }
+        }
 
         // If this client was sharing, broadcast SCREEN_STOP
         if (it->second.screen_sharing) {
@@ -224,14 +271,15 @@ static void tcp_accept_loop(SOCKET listen_sock) {
                 }
             }
 
-            // Send chat history to the new client
-            {
-                std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
-                for (auto& entry : g_chat_history) {
-                    auto msg = lilypad::make_text_chat_broadcast_msg(entry.sender_id, entry.text);
+            // Send VOICE_JOINED for any users currently in voice
+            for (auto& [id, existing] : g_clients) {
+                if (existing.in_voice) {
+                    auto msg = lilypad::make_voice_joined_broadcast(existing.id);
                     client_tcp.send_all(msg);
                 }
             }
+
+            // Chat history is NOT sent here — client sends CHAT_SYNC after connecting
 
             // Broadcast USER_JOINED to all existing clients
             auto joined_msg = lilypad::make_user_joined_msg(client_id, username);
@@ -435,15 +483,63 @@ static void tcp_read_loop() {
             if (header.type == lilypad::MsgType::LEAVE) {
                 remove_client(id);
             } else if (header.type == lilypad::MsgType::TEXT_CHAT && !payload.empty()) {
-                // Extract the text, store it, and broadcast to all clients
                 std::string text(reinterpret_cast<const char*>(payload.data()));
+                std::string sender_name;
+                {
+                    std::lock_guard<std::mutex> lock(g_clients_mutex);
+                    auto cit = g_clients.find(id);
+                    if (cit != g_clients.end())
+                        sender_name = cit->second.username;
+                    else
+                        sender_name = "User #" + std::to_string(id);
+                }
+                ChatEntry ce;
+                int64_t now_ts = static_cast<int64_t>(std::time(nullptr));
                 {
                     std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
-                    g_chat_history.push_back({id, text});
+                    ce.seq         = g_next_seq++;
+                    ce.sender_name = sender_name;
+                    ce.timestamp   = now_ts;
+                    ce.text        = text;
+                    g_chat_history.push_back(ce);
                 }
-                auto broadcast = lilypad::make_text_chat_broadcast_msg(id, text);
+                append_chat_to_file(ce);
+                auto broadcast = lilypad::make_text_chat_broadcast_v2(
+                    ce.seq, id, ce.timestamp, ce.sender_name, ce.text);
                 std::lock_guard<std::mutex> lock(g_clients_mutex);
                 broadcast_tcp(broadcast);
+            } else if (header.type == lilypad::MsgType::VOICE_JOIN) {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) {
+                    it->second.in_voice = true;
+                    auto msg = lilypad::make_voice_joined_broadcast(id);
+                    broadcast_tcp(msg);
+                }
+            } else if (header.type == lilypad::MsgType::VOICE_LEAVE) {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) {
+                    it->second.in_voice = false;
+                    auto msg = lilypad::make_voice_left_broadcast(id);
+                    broadcast_tcp(msg);
+                }
+            } else if (header.type == lilypad::MsgType::CHAT_SYNC && payload.size() >= 8) {
+                uint64_t last_seq = lilypad::read_u64(payload.data());
+                std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
+                std::string sender_name_unused;
+                for (auto& entry : g_chat_history) {
+                    if (entry.seq > last_seq) {
+                        auto msg = lilypad::make_text_chat_broadcast_v2(
+                            entry.seq, 0, entry.timestamp, entry.sender_name, entry.text);
+                        // Send directly to this client only (no broadcast)
+                        std::lock_guard<std::mutex> lock(g_clients_mutex);
+                        auto cit = g_clients.find(id);
+                        if (cit != g_clients.end()) {
+                            cit->second.tcp_socket.send_all(msg);
+                        }
+                    }
+                }
             } else if (header.type == lilypad::MsgType::SCREEN_START) {
                 std::lock_guard<std::mutex> lock(g_clients_mutex);
                 auto it = g_clients.find(id);
@@ -528,9 +624,12 @@ static void udp_relay_loop(SOCKET udp_sock) {
                 it->second.udp_known = true;
             }
 
-            // Forward to all other clients with known UDP addresses
+            // Only relay voice if sender is in voice channel
+            if (!it->second.in_voice) continue;
+
+            // Forward to all other clients with known UDP addresses that are in voice
             for (auto& [id, client] : g_clients) {
-                if (id == sender_id || !client.udp_known) continue;
+                if (id == sender_id || !client.udp_known || !client.in_voice) continue;
                 sendto(udp_sock, reinterpret_cast<const char*>(buf), received, 0,
                        reinterpret_cast<const sockaddr*>(&client.udp_addr),
                        sizeof(client.udp_addr));
@@ -542,6 +641,7 @@ static void udp_relay_loop(SOCKET udp_sock) {
 int main() {
     std::signal(SIGINT, signal_handler);
     load_update_config();
+    load_chat_history();
 
     try {
         lilypad::WinsockInit winsock;
