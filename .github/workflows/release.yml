@@ -57,16 +57,16 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
-          $buildDir = "out/build/x64-Release"
+          $clientDir = "out/build/x64-Release/client"
           $stagingDir = "LilyPad-v$version"
 
           New-Item -ItemType Directory -Path $stagingDir | Out-Null
 
-          Copy-Item "$buildDir/lilypad_client.exe" $stagingDir/
-          Copy-Item "$buildDir/opus.dll"           $stagingDir/
-          Copy-Item "$buildDir/portaudio.dll"      $stagingDir/
-          Copy-Item "$buildDir/turbojpeg.dll"      $stagingDir/
-          Copy-Item "$buildDir/jpeg62.dll"         $stagingDir/
+          Copy-Item "$clientDir/lilypad_client.exe" $stagingDir/
+          Copy-Item "$clientDir/opus.dll"           $stagingDir/
+          Copy-Item "$clientDir/portaudio.dll"      $stagingDir/
+          Copy-Item "$clientDir/turbojpeg.dll"      $stagingDir/
+          Copy-Item "$clientDir/jpeg62.dll"         $stagingDir/
 
           Compress-Archive -Path "$stagingDir/*" -DestinationPath "LilyPad-v$version.zip"
 
