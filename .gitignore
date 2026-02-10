@@ -1,0 +1,23 @@
+# Build output
+out/
+
+# Windows special files
+nul
+
+# Logs
+*.log
+build_log.txt
+build_output.txt
+test_output.txt
+
+# vcpkg installed packages
+vcpkg_installed/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Claude Code
+.claude/

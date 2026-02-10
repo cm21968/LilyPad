@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup vcpkg
+        shell: cmd
+        run: |
+          cd C:\vcpkg
+          bootstrap-vcpkg.bat
+          vcpkg integrate install
+
+      - name: CMake configure
+        shell: cmd
+        run: cmake --preset x64-Release
+
+      - name: CMake build
+        shell: cmd
+        run: cmake --build out/build/x64-Release
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $buildDir = "out/build/x64-Release"
+          $stagingDir = "LilyPad-v$version"
+
+          New-Item -ItemType Directory -Path $stagingDir | Out-Null
+
+          Copy-Item "$buildDir/lilypad_client.exe" $stagingDir/
+          Copy-Item "$buildDir/opus.dll"           $stagingDir/
+          Copy-Item "$buildDir/portaudio.dll"      $stagingDir/
+          Copy-Item "$buildDir/turbojpeg.dll"      $stagingDir/
+          Copy-Item "$buildDir/jpeg62.dll"         $stagingDir/
+
+          Compress-Archive -Path "$stagingDir/*" -DestinationPath "LilyPad-v$version.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LilyPad-v${{ steps.version.outputs.VERSION }}.zip
+
+      - name: Update version.txt
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/LilyPad-v${VERSION}.zip"
+
+          printf '%s\n%s\n' "$VERSION" "$DOWNLOAD_URL" > version.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.txt
+          git commit -m "Update version.txt to ${VERSION}"
+          git push origin HEAD:main

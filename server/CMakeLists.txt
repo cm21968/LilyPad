@@ -1,0 +1,2 @@
+add_executable(lilypad_server main.cpp)
+target_link_libraries(lilypad_server PRIVATE lilypad_common)

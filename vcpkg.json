@@ -1,0 +1,13 @@
+{
+  "name": "lilypad",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "opus",
+    "portaudio",
+    {
+      "name": "imgui",
+      "features": ["dx11-binding", "win32-binding", "docking-experimental"]
+    },
+    "libjpeg-turbo"
+  ]
+}
