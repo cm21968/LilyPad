@@ -66,7 +66,6 @@ jobs:
           Copy-Item "$clientDir/opus.dll"           $stagingDir/
           Copy-Item "$clientDir/portaudio.dll"      $stagingDir/
           Copy-Item "$clientDir/turbojpeg.dll"      $stagingDir/
-          Copy-Item "$clientDir/jpeg62.dll"         $stagingDir/
 
           Compress-Archive -Path "$stagingDir/*" -DestinationPath "LilyPad-v$version.zip"
 
