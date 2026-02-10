@@ -32,6 +32,11 @@ jobs:
           bootstrap-vcpkg.bat
           vcpkg integrate install
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: CMake configure
         shell: cmd
         run: cmake --preset x64-Release
