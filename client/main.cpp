@@ -38,7 +38,7 @@
 #include <vector>
 
 // ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.0";
+static constexpr const char* APP_VERSION = "1.0.2";
 
 // ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
 static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";
@@ -1623,24 +1623,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Connected");
             ImGui::Text("Server: %s", ip_buf);
             ImGui::Text("Your ID: %u", app.my_id);
-
-            // Update available button
-            if (app.update_available.load()) {
-                ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.55f, 0.15f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.68f, 0.20f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.95f, 0.78f, 0.25f, 1.0f));
-                char update_label[128];
-                {
-                    std::lock_guard<std::mutex> lk(app.update_mutex);
-                    snprintf(update_label, sizeof(update_label), "Update Available (%s)", app.update_version.c_str());
-                }
-                if (ImGui::Button(update_label, ImVec2(-1, 30))) {
-                    std::lock_guard<std::mutex> lk(app.update_mutex);
-                    ShellExecuteA(nullptr, "open", app.update_url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                }
-                ImGui::PopStyleColor(3);
-            }
 
             ImGui::Spacing();
 
