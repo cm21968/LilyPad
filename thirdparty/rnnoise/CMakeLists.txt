@@ -9,6 +9,7 @@ add_library(rnnoise STATIC
     src/pitch.c
     src/rnn.c
     src/rnnoise_tables.c
+    src/rnnoise_data.c
     src/parse_lpcnet_weights.c
 )
 

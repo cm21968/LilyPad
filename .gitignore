@@ -19,5 +19,12 @@ vcpkg_installed/
 *.user
 *.suo
 
+# rnnoise generated model data
+thirdparty/rnnoise/src/rnnoise_data.c
+thirdparty/rnnoise/src/rnnoise_data.h
+thirdparty/rnnoise/src/rnnoise_data_little.c
+thirdparty/rnnoise/src/rnnoise_data_little.h
+thirdparty/rnnoise/*.tar.gz
+
 # Claude Code
 .claude/

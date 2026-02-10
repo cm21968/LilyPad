@@ -32,6 +32,14 @@ jobs:
           bootstrap-vcpkg.bat
           vcpkg integrate install
 
+      - name: Download rnnoise model
+        shell: bash
+        run: |
+          cd thirdparty/rnnoise
+          hash=$(cat model_version)
+          curl -Lo "rnnoise_data-${hash}.tar.gz" "https://media.xiph.org/rnnoise/models/rnnoise_data-${hash}.tar.gz"
+          tar xf "rnnoise_data-${hash}.tar.gz"
+
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
