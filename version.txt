@@ -1,2 +1,2 @@
-1.0.3
-https://github.com/cm21968/LilyPad/releases/download/v1.0.3/LilyPad-v1.0.3.zip
+1.0.4
+https://github.com/cm21968/LilyPad/releases/download/v1.0.4/LilyPad-v1.0.4.zip
