@@ -38,7 +38,7 @@
 #include <vector>
 
 // ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.2";
+static constexpr const char* APP_VERSION = "1.0.3";
 
 // ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
 static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";

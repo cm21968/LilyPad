@@ -1,3 +1,9 @@
 1. Update APP_VERSION in client/main.cpp                                                                               
 2. Commit and push
 3. Tag and push: git tag v1.2.0 && git push origin v1.2.0
+
+git add .
+git commit -m "Removing the inside server update button"
+git push origin main
+git tag v1.0.2
+git push origin v1.0.2

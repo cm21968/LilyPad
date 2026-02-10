@@ -7,6 +7,7 @@ add_executable(lilypad_client WIN32
     audio.cpp
     screen_capture.cpp
     system_audio.cpp
+    lilypad_client.rc
 )
 
 target_link_libraries(lilypad_client PRIVATE
