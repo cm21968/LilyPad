@@ -1,18 +1,19 @@
 find_package(portaudio CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
-find_package(libjpeg-turbo CONFIG REQUIRED)
 
 add_executable(lilypad_client WIN32
     main.cpp
     audio.cpp
     screen_capture.cpp
     system_audio.cpp
+    h264_encoder.cpp
+    h264_decoder.cpp
     lilypad_client.rc
 )
 
 target_link_libraries(lilypad_client PRIVATE
     lilypad_common
-    portaudio
+    portaudio_static
     imgui::imgui
     rnnoise
     d3d11
@@ -21,5 +22,7 @@ target_link_libraries(lilypad_client PRIVATE
     mmdevapi
     uuid
     wininet
-    $<IF:$<TARGET_EXISTS:libjpeg-turbo::turbojpeg>,libjpeg-turbo::turbojpeg,libjpeg-turbo::turbojpeg-static>
+    mf
+    mfplat
+    mfuuid
 )

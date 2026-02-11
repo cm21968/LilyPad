@@ -5,6 +5,8 @@
 #include "audio.h"
 #include "audio_codec.h"
 #include "chat_persistence.h"
+#include "h264_encoder.h"
+#include "h264_decoder.h"
 #include "network.h"
 #include "protocol.h"
 #include "screen_capture.h"
@@ -18,6 +20,8 @@
 #include <dxgi.h>
 #include <windows.h>
 #include <tchar.h>
+
+#include <mfapi.h>
 
 #include <rnnoise.h>
 
@@ -39,7 +43,7 @@
 #include <vector>
 
 // ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.4";
+static constexpr const char* APP_VERSION = "1.0.5";
 
 // ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
 static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";
@@ -120,6 +124,60 @@ static void save_favorites(const std::vector<ServerFavorite>& favs) {
     for (auto& f : favs) {
         file << f.name << '\t' << f.ip << '\t' << f.username << '\n';
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Settings (auto-connect, etc.)
+// ════════════════════════════════════════════════════════════════
+struct AppSettings {
+    bool auto_connect = false;
+    std::string last_server_ip;
+    std::string last_username;
+};
+
+static std::string get_settings_path() {
+    PWSTR documents = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, documents, -1, nullptr, 0, nullptr, nullptr);
+        std::string path(len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, documents, -1, path.data(), len, nullptr, nullptr);
+        CoTaskMemFree(documents);
+
+        path += "\\LilyPad";
+        CreateDirectoryA(path.c_str(), nullptr);
+        return path + "\\settings.txt";
+    }
+    return "";
+}
+
+static AppSettings load_settings() {
+    AppSettings s;
+    std::string path = get_settings_path();
+    if (path.empty()) return s;
+
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "auto_connect") s.auto_connect = (val == "1");
+        else if (key == "last_server_ip") s.last_server_ip = val;
+        else if (key == "last_username") s.last_username = val;
+    }
+    return s;
+}
+
+static void save_settings(const AppSettings& s) {
+    std::string path = get_settings_path();
+    if (path.empty()) return;
+
+    std::ofstream file(path, std::ios::trunc);
+    file << "auto_connect=" << (s.auto_connect ? "1" : "0") << '\n';
+    file << "last_server_ip=" << s.last_server_ip << '\n';
+    file << "last_username=" << s.last_username << '\n';
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -339,6 +397,7 @@ struct AppState {
     std::mutex                             sys_audio_mutex;
     std::deque<std::vector<float>>         sys_audio_frames;
     std::unique_ptr<lilypad::OpusDecoderWrapper> sys_audio_decoder;
+    float                                  stream_volume = 1.0f;  // 0.0–1.0
 
     // Screen send queue — decouples capture/encode from TCP sending
     std::mutex                          screen_send_mutex;
@@ -348,28 +407,27 @@ struct AppState {
 
     // Screen sharing — outgoing (this client is sharing)
     std::atomic<bool> screen_sharing{false};
-    std::atomic<int>  screen_resolution{0}; // 0=720p, 1=1080p (maps to ScreenResolution)
-    std::atomic<int>  screen_fps{0};        // 0=30fps, 1=60fps (maps to ScreenFps)
 
     // Screen sharing — incoming (watching another client)
     std::atomic<uint32_t> watching_user_id{0};      // 0 = not watching
     std::mutex            screen_frame_mutex;
-    std::vector<uint8_t>  screen_jpeg_buf;           // raw JPEG from network (decoded on main thread)
-    bool                  screen_jpeg_new    = false;
+    std::vector<uint8_t>  screen_frame_buf;          // H.264 data from network
+    uint8_t               screen_frame_flags = 0;    // flags byte from protocol
+    bool                  screen_frame_new   = false;
 
-    // Decoded RGBA buffer (produced by decode thread, consumed by main thread)
+    // H.264 decode thread (produces SRV directly via decoder)
     std::condition_variable screen_decode_cv;
-    std::vector<uint8_t>    screen_rgba_buf;
-    int                     screen_rgba_w = 0;
-    int                     screen_rgba_h = 0;
-    bool                    screen_rgba_new = false;
     std::unique_ptr<std::thread> screen_decode_thread;
 
-    // D3D11 texture for viewer (created/updated on main thread)
-    ID3D11Texture2D*          screen_texture = nullptr;
-    ID3D11ShaderResourceView* screen_srv     = nullptr;
-    int                       screen_tex_w   = 0;
-    int                       screen_tex_h   = 0;
+    // H.264 decoder output SRV (set by decode thread, read by main thread)
+    std::mutex                    screen_srv_mutex;
+    ID3D11ShaderResourceView*     screen_srv       = nullptr;  // not owned — decoder owns it
+    int                           screen_srv_w     = 0;
+    int                           screen_srv_h     = 0;
+
+    // Keyframe request from server
+    std::atomic<bool> force_keyframe{false};
+    std::atomic<int>  h264_bitrate{0};  // 0 = auto (set based on resolution)
 
     void add_system_msg(const std::string& text) {
         std::lock_guard<std::mutex> lk(chat_mutex);
@@ -466,31 +524,66 @@ static void check_for_update_thread(AppState& app) {
 //  Network threads
 // ════════════════════════════════════════════════════════════════
 
-// ── Screen decode thread: decodes JPEG→RGBA off the main thread ──
+// ── Screen decode thread: decodes H.264→RGBA via Media Foundation ──
 static void screen_decode_thread_func(AppState& app) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+    lilypad::H264Decoder decoder;
+    if (!decoder.init(g_d3d_device)) {
+        app.add_system_msg("H.264 decoder init failed");
+        CoUninitialize();
+        return;
+    }
+
+    int frames_received = 0;
+    int frames_decoded = 0;
+
     while (app.running && app.connected) {
-        std::vector<uint8_t> jpeg_copy;
+        std::vector<uint8_t> frame_copy;
+        uint8_t flags = 0;
         {
             std::unique_lock<std::mutex> lk(app.screen_frame_mutex);
             app.screen_decode_cv.wait_for(lk, std::chrono::milliseconds(5),
-                [&] { return app.screen_jpeg_new || !app.connected || !app.running; });
+                [&] { return app.screen_frame_new || !app.connected || !app.running; });
             if (!app.connected || !app.running) break;
-            if (!app.screen_jpeg_new || app.screen_jpeg_buf.empty()) continue;
-            jpeg_copy.swap(app.screen_jpeg_buf);
-            app.screen_jpeg_new = false;
+            if (!app.screen_frame_new || app.screen_frame_buf.empty()) continue;
+            frame_copy.swap(app.screen_frame_buf);
+            flags = app.screen_frame_flags;
+            app.screen_frame_new = false;
         }
 
-        int fw = 0, fh = 0;
-        auto rgba = lilypad::decode_jpeg_to_rgba(jpeg_copy.data(), jpeg_copy.size(), fw, fh);
+        frames_received++;
+        bool is_keyframe = (flags & lilypad::SCREEN_FLAG_KEYFRAME) != 0;
 
-        if (!rgba.empty()) {
-            std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-            app.screen_rgba_buf = std::move(rgba);
-            app.screen_rgba_w = fw;
-            app.screen_rgba_h = fh;
-            app.screen_rgba_new = true;
+        if (frames_received <= 3) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "[Viewer] Frame #%d: %zu bytes, flags=0x%02X%s",
+                     frames_received, frame_copy.size(), flags, is_keyframe ? " (IDR)" : "");
+            app.add_system_msg(msg);
+        }
+
+        if (decoder.decode(frame_copy.data(), frame_copy.size(), is_keyframe)) {
+            frames_decoded++;
+            std::lock_guard<std::mutex> lk(app.screen_srv_mutex);
+            app.screen_srv   = decoder.get_output_srv();
+            app.screen_srv_w = decoder.width();
+            app.screen_srv_h = decoder.height();
+
+            if (frames_decoded <= 3) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "[Viewer] Decoded #%d: %dx%d, SRV=%s",
+                         frames_decoded, decoder.width(), decoder.height(),
+                         decoder.get_output_srv() ? "OK" : "null");
+                app.add_system_msg(msg);
+            }
+        } else if (frames_received <= 5) {
+            app.add_system_msg("[Viewer] Decode failed for frame #" + std::to_string(frames_received));
         }
     }
+
+    decoder.flush();
+    decoder.shutdown();
+    CoUninitialize();
 }
 
 // ── Screen send thread: drains queue with audio priority, drops stale video frames ──
@@ -525,28 +618,45 @@ static void screen_send_thread_func(AppState& app) {
 
 // ── Screen capture thread (runs while this client is sharing) ──
 static void screen_capture_thread_func(AppState& app) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     using clock = std::chrono::steady_clock;
     auto next_frame = clock::now();
 
-    // Persistent capturer — uses DXGI Desktop Duplication (GPU-accelerated),
-    // falls back to GDI if DXGI is unavailable.
     lilypad::ScreenCapturer capturer;
 
-    // Adaptive JPEG quality — starts high, reduces when frames are large or backing up
-    int quality = 85;
-    static constexpr int    QUALITY_MIN      = 40;
-    static constexpr int    QUALITY_MAX      = 92;
-    static constexpr size_t FRAME_SIZE_HIGH  = 300000; // 300KB — reduce quality
-    static constexpr size_t FRAME_SIZE_LOW   = 120000; // 120KB — increase quality
+    if (!capturer.get_device()) {
+        app.add_system_msg("Screen capture init failed (no D3D11 device)");
+        CoUninitialize();
+        return;
+    }
 
+    // Encode at native capture resolution, 30fps (bitrate controls quality)
+    constexpr int fps_val = 30;
+    constexpr int interval_ms = 33;
+    int enc_w = capturer.screen_width() & ~1;
+    int enc_h = capturer.screen_height() & ~1;
+
+    // Auto bitrate based on resolution
+    int bitrate = app.h264_bitrate.load();
+    if (bitrate <= 0) {
+        int pixels = enc_w * enc_h;
+        if (pixels >= 3686400)       bitrate = 30000000;  // 2560x1440+: 30 Mbps
+        else if (pixels >= 2073600)  bitrate = 18000000;  // 1920x1080:  18 Mbps
+        else if (pixels >= 921600)   bitrate = 10000000;  // 1280x720:   10 Mbps
+        else                         bitrate = 6000000;   // smaller:    6 Mbps
+        app.h264_bitrate.store(bitrate);
+    }
+
+    lilypad::H264Encoder encoder;
+    if (!encoder.init(capturer.get_device(), enc_w, enc_h, fps_val, bitrate)) {
+        app.add_system_msg("H.264 encoder init failed");
+        CoUninitialize();
+        return;
+    }
+
+    int cap_frame = 0;
     while (app.running && app.connected && app.screen_sharing) {
-        auto res = static_cast<lilypad::ScreenResolution>(app.screen_resolution.load());
-        auto fps = static_cast<lilypad::ScreenFps>(app.screen_fps.load());
-
-        int target_w = 0, target_h = 0;
-        lilypad::get_capture_dimensions(res, target_w, target_h);
-        int interval_ms = lilypad::get_capture_interval_ms(fps);
-
         next_frame += std::chrono::milliseconds(interval_ms);
 
         // Skip this frame if a video frame is still queued (sender can't keep up)
@@ -557,8 +667,6 @@ static void screen_capture_thread_func(AppState& app) {
                 if (!item.is_audio) { has_pending_frame = true; break; }
             }
             if (has_pending_frame) {
-                // Queue backed up — drop this frame and reduce quality
-                quality = (std::max)(QUALITY_MIN, quality - 5);
                 auto now = clock::now();
                 if (next_frame > now)
                     std::this_thread::sleep_until(next_frame);
@@ -568,26 +676,43 @@ static void screen_capture_thread_func(AppState& app) {
             }
         }
 
+        // Update bitrate if changed
+        int new_bitrate = app.h264_bitrate.load();
+        if (new_bitrate != bitrate) {
+            bitrate = new_bitrate;
+            encoder.set_bitrate(bitrate);
+        }
+
         int w = 0, h = 0;
-        auto jpeg = capturer.capture_jpeg(quality, target_w, target_h, w, h);
+        auto* tex = capturer.capture_texture(w, h);
 
-        if (!jpeg.empty()) {
-            // Adaptive quality: adjust based on encoded frame size
-            if (jpeg.size() > FRAME_SIZE_HIGH) {
-                quality = (std::max)(QUALITY_MIN, quality - 3);
-            } else if (jpeg.size() < FRAME_SIZE_LOW) {
-                quality = (std::min)(QUALITY_MAX, quality + 2);
+        cap_frame++;
+
+        if (tex) {
+            bool force_idr = app.force_keyframe.exchange(false);
+            bool is_keyframe = false;
+            auto h264 = encoder.encode(tex, force_idr, is_keyframe);
+
+            if (!h264.empty()) {
+                uint8_t flags = is_keyframe ? lilypad::SCREEN_FLAG_KEYFRAME : 0;
+                auto msg = lilypad::make_screen_frame_msg(
+                    static_cast<uint16_t>(enc_w), static_cast<uint16_t>(enc_h),
+                    flags, h264.data(), h264.size());
+
+                {
+                    std::lock_guard<std::mutex> lk(app.screen_send_mutex);
+                    app.screen_send_queue.push_back({std::move(msg), false});
+                }
+                app.screen_send_cv.notify_one();
+            } else if (cap_frame <= 10) {
+                char dbg[128];
+                snprintf(dbg, sizeof(dbg), "[CapThread] Frame %d: encode returned empty\n", cap_frame);
+                OutputDebugStringA(dbg);
             }
-
-            auto msg = lilypad::make_screen_frame_msg(
-                static_cast<uint16_t>(w), static_cast<uint16_t>(h),
-                jpeg.data(), jpeg.size());
-
-            {
-                std::lock_guard<std::mutex> lk(app.screen_send_mutex);
-                app.screen_send_queue.push_back({std::move(msg), false});
-            }
-            app.screen_send_cv.notify_one();
+        } else if (cap_frame <= 10) {
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "[CapThread] Frame %d: capture_texture returned null\n", cap_frame);
+            OutputDebugStringA(dbg);
         }
 
         // Sleep until next frame time; if we're behind, reset to now
@@ -598,12 +723,31 @@ static void screen_capture_thread_func(AppState& app) {
             next_frame = now;
         }
     }
+
+    {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg), "[CapThread] Exiting: running=%d connected=%d sharing=%d frames=%d\n",
+                 (int)app.running.load(), (int)app.connected.load(), (int)app.screen_sharing.load(), cap_frame);
+        OutputDebugStringA(dbg);
+    }
+    CoUninitialize();
 }
 
 // ── System audio capture thread (runs alongside screen sharing) ──
 static void sys_audio_capture_thread_func(AppState& app) {
     try {
         SystemAudioCapture capture;
+
+        if (!capture.is_initialized()) {
+            app.add_system_msg("System audio capture failed to initialize.");
+            return;
+        }
+        if (capture.excludes_self()) {
+            app.add_system_msg("System audio: capturing (LilyPad audio excluded).");
+        } else {
+            app.add_system_msg("System audio: fallback mode (LilyPad audio may be included).");
+        }
+
         lilypad::OpusEncoderWrapper encoder;
 
         // Accumulate mono samples until we have a full 960-sample (20ms) frame
@@ -780,18 +924,19 @@ static void tcp_receive_thread(AppState& app) {
             break;
         }
         case lilypad::MsgType::SCREEN_FRAME: {
-            // Server relay: sharer_id(4) + width(2) + height(2) + jpeg
-            // Just store the raw JPEG — decode happens on the main thread
-            if (payload.size() >= 8) {
+            // Server relay: sharer_id(4) + width(2) + height(2) + flags(1) + h264_data
+            if (payload.size() >= 9) {
                 uint32_t sharer_id = lilypad::read_u32(payload.data());
                 if (sharer_id == app.watching_user_id.load()) {
-                    const uint8_t* jpeg = payload.data() + 8;
-                    size_t jpeg_len = payload.size() - 8;
+                    uint8_t flags = payload[8];
+                    const uint8_t* frame_data = payload.data() + 9;
+                    size_t frame_len = payload.size() - 9;
 
                     {
                         std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-                        app.screen_jpeg_buf.assign(jpeg, jpeg + jpeg_len);
-                        app.screen_jpeg_new = true;
+                        app.screen_frame_buf.assign(frame_data, frame_data + frame_len);
+                        app.screen_frame_flags = flags;
+                        app.screen_frame_new = true;
                     }
                     app.screen_decode_cv.notify_one();
                 }
@@ -821,6 +966,11 @@ static void tcp_receive_thread(AppState& app) {
                     } catch (...) {}
                 }
             }
+            break;
+        }
+        case lilypad::MsgType::SCREEN_REQUEST_KEYFRAME: {
+            // Server requests that we produce an IDR keyframe
+            app.force_keyframe = true;
             break;
         }
         case lilypad::MsgType::UPDATE_AVAILABLE: {
@@ -1018,9 +1168,10 @@ static void audio_playback_thread_func(AppState& app) {
         {
             std::lock_guard<std::mutex> lk(app.sys_audio_mutex);
             if (!app.sys_audio_frames.empty()) {
+                float vol = app.stream_volume;
                 auto& sa = app.sys_audio_frames.front();
                 for (size_t i = 0; i < frame_len && i < sa.size(); ++i) {
-                    mixed[i] += sa[i];
+                    mixed[i] += sa[i] * vol;
                 }
                 app.sys_audio_frames.pop_front();
             }
@@ -1128,10 +1279,12 @@ static void do_connect(AppState& app, const std::string& server_ip, const std::s
         // Reset screen sharing state
         app.screen_sharing = false;
         app.watching_user_id = 0;
+        app.force_keyframe = false;
         {
             std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-            app.screen_jpeg_buf.clear();
-            app.screen_jpeg_new = false;
+            app.screen_frame_buf.clear();
+            app.screen_frame_flags = 0;
+            app.screen_frame_new = false;
         }
 
         // Load chat cache from disk
@@ -1292,20 +1445,20 @@ static void do_disconnect(AppState& app) {
         app.screen_send_queue.clear();
     }
 
-    // Clean up screen viewer texture
-    if (app.screen_srv) { app.screen_srv->Release(); app.screen_srv = nullptr; }
-    if (app.screen_texture) { app.screen_texture->Release(); app.screen_texture = nullptr; }
-    app.screen_tex_w = 0;
-    app.screen_tex_h = 0;
+    // Clean up screen viewer state (SRV is owned by decoder thread, not us)
+    {
+        std::lock_guard<std::mutex> lk(app.screen_srv_mutex);
+        app.screen_srv = nullptr;
+        app.screen_srv_w = 0;
+        app.screen_srv_h = 0;
+    }
     {
         std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-        app.screen_jpeg_buf.clear();
-        app.screen_jpeg_new = false;
-        app.screen_rgba_buf.clear();
-        app.screen_rgba_new = false;
-        app.screen_rgba_w = 0;
-        app.screen_rgba_h = 0;
+        app.screen_frame_buf.clear();
+        app.screen_frame_flags = 0;
+        app.screen_frame_new = false;
     }
+    app.force_keyframe = false;
 
     {
         std::lock_guard<std::mutex> lk(app.users_mutex);
@@ -1403,6 +1556,8 @@ static void ApplyLilyPadTheme() {
 // ════════════════════════════════════════════════════════════════
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    MFStartup(MF_VERSION);
     lilypad::WinsockInit winsock;
     lilypad::PortAudioInit pa;
 
@@ -1469,10 +1624,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     bool noise_suppression = false;
 
     // Screen sharing UI state
-    int screen_res_sel = 0; // 0=720p, 1=1080p
-    int screen_fps_sel = 0; // 0=30fps, 1=60fps
-    static const char* screen_res_names[] = { "720p", "1080p" };
-    static const char* screen_fps_names[] = { "30 FPS", "60 FPS" };
+    int bitrate_mbps = 0;  // 0 = auto
 
     bool scroll_chat_to_bottom = true;
 
@@ -1480,6 +1632,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     auto favorites = load_favorites();
     int  selected_fav = -1;
     char fav_name_buf[64] = "";
+
+    // Settings (auto-connect)
+    auto settings = load_settings();
+    bool auto_connect = settings.auto_connect;
+    bool auto_connect_pending = false;
+
+    // Pre-fill last server info if auto-connect is enabled
+    if (auto_connect && !settings.last_server_ip.empty()) {
+        strncpy(ip_buf, settings.last_server_ip.c_str(), sizeof(ip_buf) - 1);
+        ip_buf[sizeof(ip_buf) - 1] = '\0';
+        if (!settings.last_username.empty()) {
+            strncpy(username_buf, settings.last_username.c_str(), sizeof(username_buf) - 1);
+            username_buf[sizeof(username_buf) - 1] = '\0';
+        }
+        auto_connect_pending = true;
+    }
 
     // ── Main loop ──
     ImVec4 clear_color = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
@@ -1495,6 +1663,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
         if (!running) break;
 
+        // Auto-connect to last server on first frame
+        if (auto_connect_pending) {
+            auto_connect_pending = false;
+            if (!settings.last_username.empty()) {
+                do_connect(app, ip_buf, username_buf);
+            }
+        }
+
         // Poll PTT key state
         if (app.ptt_enabled) {
             bool held = (GetAsyncKeyState(app.ptt_key.load()) & 0x8000) != 0;
@@ -1505,65 +1681,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // ── Upload decoded RGBA to D3D11 texture (decode happens on separate thread) ──
-        {
-            std::vector<uint8_t> rgba;
-            int fw = 0, fh = 0;
-            {
-                std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-                if (app.screen_rgba_new && !app.screen_rgba_buf.empty()) {
-                    rgba.swap(app.screen_rgba_buf);
-                    fw = app.screen_rgba_w;
-                    fh = app.screen_rgba_h;
-                    app.screen_rgba_new = false;
-                }
-            }
-
-            if (!rgba.empty()) {
-                // Recreate texture if size changed
-                if (fw != app.screen_tex_w || fh != app.screen_tex_h) {
-                    if (app.screen_srv) { app.screen_srv->Release(); app.screen_srv = nullptr; }
-                    if (app.screen_texture) { app.screen_texture->Release(); app.screen_texture = nullptr; }
-
-                    D3D11_TEXTURE2D_DESC desc{};
-                    desc.Width            = fw;
-                    desc.Height           = fh;
-                    desc.MipLevels        = 1;
-                    desc.ArraySize        = 1;
-                    desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
-                    desc.SampleDesc.Count = 1;
-                    desc.Usage            = D3D11_USAGE_DYNAMIC;
-                    desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-                    desc.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
-
-                    g_d3d_device->CreateTexture2D(&desc, nullptr, &app.screen_texture);
-                    if (app.screen_texture) {
-                        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-                        srv_desc.Format                    = desc.Format;
-                        srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
-                        srv_desc.Texture2D.MipLevels       = 1;
-                        g_d3d_device->CreateShaderResourceView(app.screen_texture, &srv_desc, &app.screen_srv);
-                    }
-
-                    app.screen_tex_w = fw;
-                    app.screen_tex_h = fh;
-                }
-
-                // Upload pixel data
-                if (app.screen_texture) {
-                    D3D11_MAPPED_SUBRESOURCE mapped{};
-                    HRESULT hr = g_d3d_context->Map(app.screen_texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-                    if (SUCCEEDED(hr)) {
-                        for (int y = 0; y < fh; ++y) {
-                            memcpy(static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
-                                   rgba.data() + y * fw * 4,
-                                   fw * 4);
-                        }
-                        g_d3d_context->Unmap(app.screen_texture, 0);
-                    }
-                }
-            }
-        }
+        // ── Screen viewer SRV comes directly from H.264 decoder (no upload needed) ──
 
         // ── Full-window panel ──
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -1621,42 +1739,62 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Separator();
             ImGui::Spacing();
 
-            if (!favorites.empty()) {
-                const char* fav_preview = (selected_fav >= 0 && selected_fav < static_cast<int>(favorites.size()))
-                    ? favorites[selected_fav].name.c_str() : "Select a server...";
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::BeginCombo("##favs", fav_preview)) {
-                    for (int i = 0; i < static_cast<int>(favorites.size()); ++i) {
-                        bool sel = (selected_fav == i);
-                        std::string label = favorites[i].name + "  (" + favorites[i].ip + ")";
-                        if (ImGui::Selectable(label.c_str(), sel)) {
-                            selected_fav = i;
-                            // Copy selected IP and username into the fields
-                            strncpy(ip_buf, favorites[i].ip.c_str(), sizeof(ip_buf) - 1);
-                            ip_buf[sizeof(ip_buf) - 1] = '\0';
-                            if (!favorites[i].username.empty()) {
-                                strncpy(username_buf, favorites[i].username.c_str(), sizeof(username_buf) - 1);
-                                username_buf[sizeof(username_buf) - 1] = '\0';
-                            }
-                        }
-                        if (sel) ImGui::SetItemDefaultFocus();
+            // Favorite server buttons — click to connect, X to remove
+            int fav_to_remove = -1;
+            for (int i = 0; i < static_cast<int>(favorites.size()); ++i) {
+                ImGui::PushID(i);
+
+                // X remove button (small, red)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.50f, 0.18f, 0.18f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+                if (ImGui::SmallButton("X")) {
+                    fav_to_remove = i;
+                }
+                ImGui::PopStyleColor(3);
+
+                ImGui::SameLine();
+
+                // Connect button (full width, green)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
+                if (ImGui::Button(favorites[i].name.c_str(), ImVec2(-1, 0))) {
+                    // Fill fields and connect
+                    strncpy(ip_buf, favorites[i].ip.c_str(), sizeof(ip_buf) - 1);
+                    ip_buf[sizeof(ip_buf) - 1] = '\0';
+                    if (!favorites[i].username.empty()) {
+                        strncpy(username_buf, favorites[i].username.c_str(), sizeof(username_buf) - 1);
+                        username_buf[sizeof(username_buf) - 1] = '\0';
                     }
-                    ImGui::EndCombo();
+                    app.ptt_enabled = ptt_enabled;
+                    app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
+                    app.noise_suppression = noise_suppression;
+                    do_connect(app, favorites[i].ip, favorites[i].username.empty() ? std::string(username_buf) : favorites[i].username);
+
+                    if (app.connected.load()) {
+                        settings.last_server_ip = ip_buf;
+                        settings.last_username = username_buf;
+                        save_settings(settings);
+                    }
+                }
+                ImGui::PopStyleColor(3);
+
+                // Tooltip with IP on hover
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", favorites[i].ip.c_str());
                 }
 
-                // Remove button
-                if (selected_fav >= 0 && selected_fav < static_cast<int>(favorites.size())) {
-                    if (ImGui::SmallButton("Remove")) {
-                        favorites.erase(favorites.begin() + selected_fav);
-                        selected_fav = -1;
-                        save_favorites(favorites);
-                    }
-                }
-
-                ImGui::Spacing();
+                ImGui::PopID();
+            }
+            if (fav_to_remove >= 0) {
+                favorites.erase(favorites.begin() + fav_to_remove);
+                selected_fav = -1;
+                save_favorites(favorites);
             }
 
             // Save current IP to favorites
+            ImGui::Spacing();
             ImGui::Text("Name");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##fav_name", fav_name_buf, sizeof(fav_name_buf));
@@ -1764,6 +1902,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::Spacing();
             }
 
+            // Auto-connect toggle
+            if (ImGui::Checkbox("Auto-connect to last server", &auto_connect)) {
+                settings.auto_connect = auto_connect;
+                save_settings(settings);
+            }
+
+            ImGui::Spacing();
+
             // Connect button
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
@@ -1773,6 +1919,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
                 app.noise_suppression = noise_suppression;
                 do_connect(app, ip_buf, username_buf);
+
+                // Save last server for auto-connect
+                if (app.connected.load()) {
+                    settings.last_server_ip = ip_buf;
+                    settings.last_username = username_buf;
+                    save_settings(settings);
+                }
             }
             ImGui::PopStyleColor(3);
 
@@ -1913,33 +2066,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Separator();
             ImGui::Spacing();
 
-            ImGui::Text("Resolution");
+            ImGui::Text("Bitrate");
             ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##screen_res", screen_res_names[screen_res_sel])) {
-                for (int i = 0; i < 2; ++i) {
-                    bool sel = (screen_res_sel == i);
-                    if (ImGui::Selectable(screen_res_names[i], sel)) {
-                        screen_res_sel = i;
-                        app.screen_resolution = i;
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
+            if (bitrate_mbps == 0) {
+                // Show current auto value
+                int cur = app.h264_bitrate.load();
+                char auto_label[32];
+                snprintf(auto_label, sizeof(auto_label), "Auto (%d Mbps)", cur / 1000000);
+                ImGui::TextDisabled("%s", auto_label);
             }
-
-            ImGui::Spacing();
-            ImGui::Text("Frame Rate");
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##screen_fps", screen_fps_names[screen_fps_sel])) {
-                for (int i = 0; i < 2; ++i) {
-                    bool sel = (screen_fps_sel == i);
-                    if (ImGui::Selectable(screen_fps_names[i], sel)) {
-                        screen_fps_sel = i;
-                        app.screen_fps = i;
-                    }
-                    if (sel) ImGui::SetItemDefaultFocus();
+            if (ImGui::SliderInt("##bitrate", &bitrate_mbps, 0, 50, bitrate_mbps == 0 ? "Auto" : "%d Mbps")) {
+                if (bitrate_mbps > 0) {
+                    app.h264_bitrate.store(bitrate_mbps * 1000000);
+                } else {
+                    app.h264_bitrate.store(0);  // reset to auto on next share
                 }
-                ImGui::EndCombo();
             }
 
             ImGui::Spacing();
@@ -2191,31 +2332,51 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         // ── Screen viewer floating window ──
         uint32_t watching_id = app.watching_user_id.load();
-        if (watching_id != 0 && app.screen_srv && app.screen_tex_w > 0 && app.screen_tex_h > 0) {
-            std::string watcher_name = app.lookup_username(watching_id);
-            std::string win_title = "Screen: " + watcher_name;
-
-            ImGui::SetNextWindowSize(ImVec2(640, 400), ImGuiCond_FirstUseEver);
-            bool viewer_open = true;
-            if (ImGui::Begin(win_title.c_str(), &viewer_open, ImGuiWindowFlags_NoCollapse)) {
-                ImVec2 avail = ImGui::GetContentRegionAvail();
-                float aspect = static_cast<float>(app.screen_tex_w) / static_cast<float>(app.screen_tex_h);
-                float disp_w = avail.x;
-                float disp_h = avail.x / aspect;
-                if (disp_h > avail.y) {
-                    disp_h = avail.y;
-                    disp_w = avail.y * aspect;
-                }
-                // Center the image
-                float offset_x = (avail.x - disp_w) * 0.5f;
-                if (offset_x > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset_x);
-                ImGui::Image((ImTextureID)(uintptr_t)app.screen_srv, ImVec2(disp_w, disp_h));
+        {
+            ID3D11ShaderResourceView* srv = nullptr;
+            int srv_w = 0, srv_h = 0;
+            {
+                std::lock_guard<std::mutex> lk(app.screen_srv_mutex);
+                srv   = app.screen_srv;
+                srv_w = app.screen_srv_w;
+                srv_h = app.screen_srv_h;
             }
-            ImGui::End();
+            if (watching_id != 0 && srv && srv_w > 0 && srv_h > 0) {
+                std::string watcher_name = app.lookup_username(watching_id);
+                std::string win_title = "Screen: " + watcher_name;
 
-            if (!viewer_open) {
-                app.send_tcp(lilypad::make_screen_unsubscribe_msg(watching_id));
-                app.watching_user_id = 0;
+                ImGui::SetNextWindowSize(ImVec2(640, 400), ImGuiCond_FirstUseEver);
+                bool viewer_open = true;
+                if (ImGui::Begin(win_title.c_str(), &viewer_open, ImGuiWindowFlags_NoCollapse)) {
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    float aspect = static_cast<float>(srv_w) / static_cast<float>(srv_h);
+                    float disp_w = avail.x;
+                    float disp_h = avail.x / aspect;
+                    if (disp_h > avail.y) {
+                        disp_h = avail.y;
+                        disp_w = avail.y * aspect;
+                    }
+                    float offset_x = (avail.x - disp_w) * 0.5f;
+                    if (offset_x > 0) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset_x);
+                    ImGui::Image((ImTextureID)(uintptr_t)srv, ImVec2(disp_w, disp_h));
+
+                    // Right-click context menu
+                    if (ImGui::BeginPopupContextWindow("##stream_ctx")) {
+                        ImGui::Text("Stream Volume");
+                        ImGui::SetNextItemWidth(150);
+                        int vol_pct = static_cast<int>(app.stream_volume * 100.0f + 0.5f);
+                        if (ImGui::SliderInt("##stream_vol", &vol_pct, 0, 200, "%d%%")) {
+                            app.stream_volume = static_cast<float>(vol_pct) / 100.0f;
+                        }
+                        ImGui::EndPopup();
+                    }
+                }
+                ImGui::End();
+
+                if (!viewer_open) {
+                    app.send_tcp(lilypad::make_screen_unsubscribe_msg(watching_id));
+                    app.watching_user_id = 0;
+                }
             }
         }
 
@@ -2239,6 +2400,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     CleanupD3D();
     DestroyWindow(hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);
+
+    MFShutdown();
+    CoUninitialize();
 
     return 0;
 }

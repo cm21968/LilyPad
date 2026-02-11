@@ -26,7 +26,10 @@ static const IID    IID_IAudioCaptureClient   = __uuidof(IAudioCaptureClient);
 #define FMT()      static_cast<WAVEFORMATEX*>(mix_format_)
 
 // ── Minimal IActivateAudioInterfaceCompletionHandler for synchronous wait ──
-class ActivateAudioInterfaceHandler : public IActivateAudioInterfaceCompletionHandler {
+// Must also advertise IAgileObject — ActivateAudioInterfaceAsync queries for it
+// and returns E_ILLEGAL_METHOD_CALL if the handler isn't agile.
+class ActivateAudioInterfaceHandler : public IActivateAudioInterfaceCompletionHandler,
+                                      public IAgileObject {
 public:
     ActivateAudioInterfaceHandler() {
         event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -37,7 +40,9 @@ public:
 
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+        if (riid == __uuidof(IUnknown) ||
+            riid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
+            riid == __uuidof(IAgileObject)) {
             *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
             AddRef();
             return S_OK;
@@ -127,6 +132,9 @@ SystemAudioCapture::SystemAudioCapture() {
 
     // ── Path 1: Process-exclude loopback (Windows 10 2004+ / build 19041+) ──
     // Captures all system audio EXCEPT this process's own audio output.
+    // The process-loopback virtual device doesn't support GetMixFormat, so we
+    // use a known format with AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM to let WASAPI
+    // convert from the device's native format.
     {
         AUDIOCLIENT_ACTIVATION_PARAMS ac_params{};
         ac_params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
@@ -143,7 +151,7 @@ SystemAudioCapture::SystemAudioCapture() {
 
         hr = ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-            IID_IAudioClient,
+            __uuidof(IAudioClient),
             &activate_params,
             handler,
             &async_op);
@@ -151,18 +159,43 @@ SystemAudioCapture::SystemAudioCapture() {
         if (SUCCEEDED(hr) && SUCCEEDED(handler->Wait())) {
             IAudioClient* client = nullptr;
             if (SUCCEEDED(handler->GetResult(&client)) && client) {
+                // Use a known capture format — WASAPI auto-converts via
+                // AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM.
+                WAVEFORMATEX* fmt = static_cast<WAVEFORMATEX*>(
+                    CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+                fmt->wFormatTag      = WAVE_FORMAT_PCM;
+                fmt->nChannels       = 2;
+                fmt->nSamplesPerSec  = 48000;
+                fmt->wBitsPerSample  = 16;
+                fmt->nBlockAlign     = fmt->nChannels * fmt->wBitsPerSample / 8;
+                fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+                fmt->cbSize          = 0;
+
+                DWORD stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+                                   | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                                   | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+                hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, stream_flags,
+                                        200000, 0, fmt, nullptr);
+
                 IAudioCaptureClient* cap = nullptr;
-                WAVEFORMATEX* fmt = nullptr;
-                // Stream flags are 0 — loopback mode is specified in activation params
-                if (init_client_for_capture(client, &fmt, &cap,
-                                            channels_, sample_rate_, is_float_, 0)) {
+                if (SUCCEEDED(hr))
+                    hr = client->GetService(IID_IAudioCaptureClient,
+                                            reinterpret_cast<void**>(&cap));
+                if (SUCCEEDED(hr) && cap)
+                    hr = client->Start();
+
+                if (SUCCEEDED(hr)) {
+                    channels_     = 2;
+                    sample_rate_  = 48000;
+                    is_float_     = false;  // 16-bit PCM
                     audio_client_ = client;
                     capture_      = cap;
                     mix_format_   = fmt;
                     exclude_self_ = true;
                     initialized_  = true;
                 } else {
-                    if (fmt) CoTaskMemFree(fmt);
+                    if (cap) cap->Release();
+                    CoTaskMemFree(fmt);
                     client->Release();
                 }
             }

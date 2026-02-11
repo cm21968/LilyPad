@@ -40,6 +40,7 @@ struct ClientInfo {
     // Screen sharing
     bool                             screen_sharing = false;
     std::unordered_set<uint32_t>     screen_subscribers; // IDs of clients watching this user
+    std::vector<uint8_t>             cached_keyframe;    // last H.264 keyframe relay msg
 };
 
 static std::mutex                                   g_clients_mutex;
@@ -110,29 +111,29 @@ static void load_update_config() {
 struct RelayItem {
     std::vector<uint8_t> data;
     uint32_t             sharer_id;
-    bool                 is_audio;  // true = SCREEN_AUDIO (high priority)
+    bool                 is_audio;     // true = SCREEN_AUDIO (high priority)
+    bool                 is_keyframe;  // true = H.264 IDR (don't drop)
 };
 
 static std::mutex               g_relay_mutex;
 static std::condition_variable  g_relay_cv;
 static std::deque<RelayItem>    g_relay_queue;
 
-static void enqueue_relay(std::vector<uint8_t> data, uint32_t sharer_id, bool is_audio) {
+static void enqueue_relay(std::vector<uint8_t> data, uint32_t sharer_id, bool is_audio, bool is_keyframe = false) {
     {
         std::lock_guard<std::mutex> lock(g_relay_mutex);
-        g_relay_queue.push_back({std::move(data), sharer_id, is_audio});
-        // Limit queue depth — drop oldest non-audio items to prevent unbounded growth
+        g_relay_queue.push_back({std::move(data), sharer_id, is_audio, is_keyframe});
+        // Limit queue depth — drop oldest non-audio, non-keyframe items to prevent unbounded growth
         while (g_relay_queue.size() > 60) {
-            // Find and remove the oldest video frame (keep audio)
             bool dropped = false;
             for (auto it = g_relay_queue.begin(); it != g_relay_queue.end(); ++it) {
-                if (!it->is_audio) {
+                if (!it->is_audio && !it->is_keyframe) {
                     g_relay_queue.erase(it);
                     dropped = true;
                     break;
                 }
             }
-            if (!dropped) break; // all items are audio, stop dropping
+            if (!dropped) break; // all items are audio or keyframes, stop dropping
         }
     }
     g_relay_cv.notify_one();
@@ -554,6 +555,7 @@ static void tcp_read_loop() {
                 if (it != g_clients.end()) {
                     it->second.screen_sharing = false;
                     it->second.screen_subscribers.clear();
+                    it->second.cached_keyframe.clear();
                     auto msg = lilypad::make_screen_stop_broadcast(id);
                     broadcast_tcp(msg);
                 }
@@ -563,6 +565,17 @@ static void tcp_read_loop() {
                 auto it = g_clients.find(target_id);
                 if (it != g_clients.end() && it->second.screen_sharing) {
                     it->second.screen_subscribers.insert(id);
+                    // Send cached keyframe to new subscriber so they can start decoding immediately
+                    auto sub_it = g_clients.find(id);
+                    if (sub_it != g_clients.end()) {
+                        if (!it->second.cached_keyframe.empty()) {
+                            sub_it->second.tcp_socket.send_all(it->second.cached_keyframe);
+                        } else {
+                            // No keyframe cached yet — ask sharer to produce one
+                            auto req = lilypad::make_screen_request_keyframe_msg();
+                            it->second.tcp_socket.send_all(req);
+                        }
+                    }
                 }
             } else if (header.type == lilypad::MsgType::SCREEN_UNSUBSCRIBE && payload.size() >= 4) {
                 uint32_t target_id = lilypad::read_u32(payload.data());
@@ -571,15 +584,28 @@ static void tcp_read_loop() {
                 if (it != g_clients.end()) {
                     it->second.screen_subscribers.erase(id);
                 }
-            } else if (header.type == lilypad::MsgType::SCREEN_FRAME && payload.size() >= 4) {
-                // Client sends: width(2) + height(2) + jpeg
+            } else if (header.type == lilypad::MsgType::SCREEN_FRAME && payload.size() >= 5) {
+                // Client sends: width(2) + height(2) + flags(1) + h264_data
                 uint16_t w = lilypad::read_u16(payload.data());
                 uint16_t h = lilypad::read_u16(payload.data() + 2);
-                const uint8_t* jpeg = payload.data() + 4;
-                size_t jpeg_len = payload.size() - 4;
+                uint8_t flags = payload[4];
+                const uint8_t* frame_data = payload.data() + 5;
+                size_t frame_len = payload.size() - 5;
 
-                auto relay = lilypad::make_screen_frame_relay(id, w, h, jpeg, jpeg_len);
-                enqueue_relay(std::move(relay), id, false);
+                bool is_keyframe = (flags & lilypad::SCREEN_FLAG_KEYFRAME) != 0;
+
+                auto relay = lilypad::make_screen_frame_relay(id, w, h, flags, frame_data, frame_len);
+
+                // Cache keyframes so new subscribers can start decoding immediately
+                if (is_keyframe) {
+                    std::lock_guard<std::mutex> lock(g_clients_mutex);
+                    auto it = g_clients.find(id);
+                    if (it != g_clients.end()) {
+                        it->second.cached_keyframe = relay;
+                    }
+                }
+
+                enqueue_relay(std::move(relay), id, false, is_keyframe);
             } else if (header.type == lilypad::MsgType::SCREEN_AUDIO && !payload.empty()) {
                 auto relay = lilypad::make_screen_audio_relay(id, payload.data(), payload.size());
                 enqueue_relay(std::move(relay), id, true);

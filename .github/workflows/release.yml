@@ -63,9 +63,6 @@ jobs:
           New-Item -ItemType Directory -Path $stagingDir | Out-Null
 
           Copy-Item "$clientDir/lilypad_client.exe" $stagingDir/
-          Copy-Item "$clientDir/opus.dll"           $stagingDir/
-          Copy-Item "$clientDir/portaudio.dll"      $stagingDir/
-          Copy-Item "$clientDir/turbojpeg.dll"      $stagingDir/
 
           Compress-Archive -Path "$stagingDir/*" -DestinationPath "LilyPad-v$version.zip"
 

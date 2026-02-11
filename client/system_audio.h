@@ -13,6 +13,11 @@ public:
     // Caller should call this in a loop with ~5-10ms sleep.
     std::vector<float> read_samples();
 
+    // True if process-exclude loopback is active (LilyPad audio excluded).
+    // False means standard loopback fallback (captures everything).
+    bool excludes_self() const { return exclude_self_; }
+    bool is_initialized() const { return initialized_; }
+
 private:
     void*  device_       = nullptr;  // IMMDevice* (only used in fallback path)
     void*  audio_client_ = nullptr;  // IAudioClient*

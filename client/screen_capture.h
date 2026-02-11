@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdint>
-#include <vector>
+
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+struct ID3D11Texture2D;
 
 namespace lilypad {
 
@@ -36,7 +39,7 @@ inline int get_capture_interval_ms(ScreenFps fps) {
 }
 
 // Persistent screen capturer — uses DXGI Desktop Duplication (GPU-accelerated).
-// Falls back to GDI if DXGI is unavailable.
+// Returns a D3D11_USAGE_DEFAULT texture suitable for direct use by the MF encoder.
 class ScreenCapturer {
 public:
     ScreenCapturer();
@@ -44,24 +47,23 @@ public:
     ScreenCapturer(const ScreenCapturer&) = delete;
     ScreenCapturer& operator=(const ScreenCapturer&) = delete;
 
-    // Capture screen as JPEG.
-    std::vector<uint8_t> capture_jpeg(int quality, int target_w, int target_h,
-                                       int& out_width, int& out_height);
+    // Capture screen as a GPU texture (D3D11_USAGE_DEFAULT).
+    // Returns the texture pointer (owned by this class, valid until next call or destruction).
+    // Returns nullptr if no new frame is available.
+    ID3D11Texture2D* capture_texture(int& out_width, int& out_height);
+
+    // Access to the D3D11 device/context used for capture (needed by H.264 encoder)
+    ID3D11Device* get_device() const;
+    ID3D11DeviceContext* get_context() const;
+
+    // Native screen dimensions
+    int screen_width() const;
+    int screen_height() const;
 
 private:
     void* impl_ = nullptr;
     bool init_dxgi();
     void release_dxgi();
 };
-
-// Legacy standalone capture (GDI-based, kept as internal fallback).
-std::vector<uint8_t> capture_screen_jpeg(int quality, int target_w, int target_h,
-                                          int& out_width, int& out_height);
-
-// Decode JPEG data to RGBA pixels.
-// Returns RGBA pixel data, sets out_width/out_height.
-// Returns empty vector on failure.
-std::vector<uint8_t> decode_jpeg_to_rgba(const uint8_t* jpeg_data, size_t jpeg_len,
-                                          int& out_width, int& out_height);
 
 } // namespace lilypad

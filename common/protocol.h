@@ -21,8 +21,8 @@ enum class MsgType : uint8_t {
     SCREEN_STOP        = 0x08,  // Client→Server: empty; Server→All: sharer_id(4)
     SCREEN_SUBSCRIBE   = 0x09,  // Client→Server: target_id(4)
     SCREEN_UNSUBSCRIBE = 0x0A,  // Client→Server: target_id(4)
-    SCREEN_FRAME       = 0x0B,  // Client→Server: width(2)+height(2)+jpeg
-                                // Server→Subscribers: sharer_id(4)+width(2)+height(2)+jpeg
+    SCREEN_FRAME       = 0x0B,  // Client→Server: width(2)+height(2)+flags(1)+h264
+                                // Server→Subscribers: sharer_id(4)+width(2)+height(2)+flags(1)+h264
     SCREEN_AUDIO       = 0x0C,  // Client→Server: opus_data
                                 // Server→Subscribers: sharer_id(4)+opus_data
 
@@ -36,6 +36,8 @@ enum class MsgType : uint8_t {
 
     // Chat sync (persistent chat)
     CHAT_SYNC      = 0x12,  // Client→Server: last_known_seq(8)
+
+    SCREEN_REQUEST_KEYFRAME = 0x13,  // Server→Client: empty payload (request IDR)
 };
 
 // ── TCP signal header: [msg_type:1][payload_len:4] = 5 bytes ──
@@ -283,25 +285,31 @@ inline std::vector<uint8_t> make_screen_unsubscribe_msg(uint32_t target_id) {
     return buf;
 }
 
-// Client→Server: width(2) + height(2) + jpeg_data
+// Screen frame flags bitmask
+constexpr uint8_t SCREEN_FLAG_KEYFRAME = 0x01;  // Bit 0: IDR keyframe
+
+// Client→Server: width(2) + height(2) + flags(1) + h264_data
 inline std::vector<uint8_t> make_screen_frame_msg(uint16_t width, uint16_t height,
-                                                   const uint8_t* jpeg, size_t jpeg_len) {
-    uint32_t payload_len = static_cast<uint32_t>(4 + jpeg_len); // 2+2+jpeg
+                                                   uint8_t flags,
+                                                   const uint8_t* data, size_t data_len) {
+    uint32_t payload_len = static_cast<uint32_t>(5 + data_len); // 2+2+1+data
     SignalHeader h{MsgType::SCREEN_FRAME, payload_len};
     auto buf = serialize_header(h);
     buf.push_back(static_cast<uint8_t>(width & 0xFF));
     buf.push_back(static_cast<uint8_t>((width >> 8) & 0xFF));
     buf.push_back(static_cast<uint8_t>(height & 0xFF));
     buf.push_back(static_cast<uint8_t>((height >> 8) & 0xFF));
-    buf.insert(buf.end(), jpeg, jpeg + jpeg_len);
+    buf.push_back(flags);
+    buf.insert(buf.end(), data, data + data_len);
     return buf;
 }
 
-// Server→Subscribers: sharer_id(4) + width(2) + height(2) + jpeg_data
+// Server→Subscribers: sharer_id(4) + width(2) + height(2) + flags(1) + h264_data
 inline std::vector<uint8_t> make_screen_frame_relay(uint32_t sharer_id, uint16_t width,
-                                                     uint16_t height, const uint8_t* jpeg,
-                                                     size_t jpeg_len) {
-    uint32_t payload_len = static_cast<uint32_t>(8 + jpeg_len); // 4+2+2+jpeg
+                                                     uint16_t height, uint8_t flags,
+                                                     const uint8_t* data,
+                                                     size_t data_len) {
+    uint32_t payload_len = static_cast<uint32_t>(9 + data_len); // 4+2+2+1+data
     SignalHeader h{MsgType::SCREEN_FRAME, payload_len};
     auto buf = serialize_header(h);
     buf.push_back(static_cast<uint8_t>(sharer_id & 0xFF));
@@ -312,8 +320,15 @@ inline std::vector<uint8_t> make_screen_frame_relay(uint32_t sharer_id, uint16_t
     buf.push_back(static_cast<uint8_t>((width >> 8) & 0xFF));
     buf.push_back(static_cast<uint8_t>(height & 0xFF));
     buf.push_back(static_cast<uint8_t>((height >> 8) & 0xFF));
-    buf.insert(buf.end(), jpeg, jpeg + jpeg_len);
+    buf.push_back(flags);
+    buf.insert(buf.end(), data, data + data_len);
     return buf;
+}
+
+// Server→Client: request keyframe from sharer (empty payload)
+inline std::vector<uint8_t> make_screen_request_keyframe_msg() {
+    SignalHeader h{MsgType::SCREEN_REQUEST_KEYFRAME, 0};
+    return serialize_header(h);
 }
 
 // ── System audio (screen sharing audio) message helpers ──
