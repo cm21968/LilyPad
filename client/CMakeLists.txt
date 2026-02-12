@@ -3,6 +3,13 @@ find_package(imgui CONFIG REQUIRED)
 
 add_executable(lilypad_client WIN32
     main.cpp
+    connection.cpp
+    d3d_helpers.cpp
+    network_threads.cpp
+    persistence.cpp
+    screen_threads.cpp
+    theme.cpp
+    update_checker.cpp
     audio.cpp
     screen_capture.cpp
     system_audio.cpp
@@ -25,4 +32,5 @@ target_link_libraries(lilypad_client PRIVATE
     mf
     mfplat
     mfuuid
+    dwmapi
 )

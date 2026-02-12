@@ -2,247 +2,118 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-#include "audio.h"
-#include "audio_codec.h"
-#include "chat_persistence.h"
-#include "h264_encoder.h"
-#include "h264_decoder.h"
-#include "network.h"
-#include "protocol.h"
-#include "screen_capture.h"
-#include "system_audio.h"
+#include "app_state.h"
+#include "connection.h"
+#include "d3d_helpers.h"
+#include "persistence.h"
+#include "screen_threads.h"
+#include "theme.h"
+#include "update_checker.h"
 
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
 
 #include <d3d11.h>
-#include <dxgi.h>
 #include <windows.h>
 #include <tchar.h>
 
 #include <mfapi.h>
 
-#include <rnnoise.h>
-
+#include <dwmapi.h>
+#include <windowsx.h>
 #include <shellapi.h>
-#include <shlobj.h>
-#include <wininet.h>
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <deque>
-#include <fstream>
-#include <memory>
-#include <mutex>
-#include <string>
 #include <thread>
-#include <unordered_map>
-#include <vector>
+#include <regex>
+#include <iostream>
 
-// ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.5";
+// Validate IP address format (IPv4)
+bool is_valid_ip(const std::string& ip) {
+    const std::regex ip_regex(
+        R"(^((25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)$)");
+    return std::regex_match(ip, ip_regex);
+}
 
-// ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
-static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";
+// Validate username (alphanumeric, 3-32 characters)
+bool is_valid_username(const std::string& username) {
+    const std::regex username_regex(R"(^[a-zA-Z0-9_]{3,32}$)");
+    return std::regex_match(username, username_regex);
+}
 
-// ── Semver comparison: returns true if remote is strictly newer than local ──
-static bool is_newer_version(const char* local, const std::string& remote) {
-    int l_major = 0, l_minor = 0, l_patch = 0;
-    int r_major = 0, r_minor = 0, r_patch = 0;
-    sscanf(local, "%d.%d.%d", &l_major, &l_minor, &l_patch);
-    sscanf(remote.c_str(), "%d.%d.%d", &r_major, &r_minor, &r_patch);
-    if (r_major != l_major) return r_major > l_major;
-    if (r_minor != l_minor) return r_minor > l_minor;
-    return r_patch > l_patch;
+// Sanitize chat input (remove control characters)
+std::string sanitize_chat_input(const std::string& input) {
+    std::string sanitized;
+    for (char c : input) {
+        if (std::isprint(static_cast<unsigned char>(c)) || std::isspace(static_cast<unsigned char>(c))) {
+            sanitized += c;
+        }
+    }
+    return sanitized;
 }
 
 // ── Forward declarations ──
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
-
-// ════════════════════════════════════════════════════════════════
-//  Server favorites
-// ════════════════════════════════════════════════════════════════
-struct ServerFavorite {
-    std::string name;      // display name
-    std::string ip;        // server IP/hostname
-    std::string username;  // last-used username for this server
-};
-
-static std::string get_favorites_path() {
-    PWSTR documents = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
-        // Convert wide string to UTF-8
-        int len = WideCharToMultiByte(CP_UTF8, 0, documents, -1, nullptr, 0, nullptr, nullptr);
-        std::string path(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, documents, -1, path.data(), len, nullptr, nullptr);
-        CoTaskMemFree(documents);
-
-        path += "\\LilyPad";
-        CreateDirectoryA(path.c_str(), nullptr); // create if doesn't exist
-        return path + "\\favorites.txt";
-    }
-    return "";
-}
-
-// File format: one server per line, tab-separated: name\tip\tusername
-static std::vector<ServerFavorite> load_favorites() {
-    std::vector<ServerFavorite> favs;
-    std::string path = get_favorites_path();
-    if (path.empty()) return favs;
-
-    std::ifstream file(path);
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        auto tab1 = line.find('\t');
-        if (tab1 != std::string::npos) {
-            auto tab2 = line.find('\t', tab1 + 1);
-            std::string name = line.substr(0, tab1);
-            std::string ip, user;
-            if (tab2 != std::string::npos) {
-                ip   = line.substr(tab1 + 1, tab2 - tab1 - 1);
-                user = line.substr(tab2 + 1);
-            } else {
-                ip = line.substr(tab1 + 1);
-            }
-            favs.push_back({name, ip, user});
-        } else {
-            favs.push_back({line, line, ""});
-        }
-    }
-    return favs;
-}
-
-static void save_favorites(const std::vector<ServerFavorite>& favs) {
-    std::string path = get_favorites_path();
-    if (path.empty()) return;
-
-    std::ofstream file(path, std::ios::trunc);
-    for (auto& f : favs) {
-        file << f.name << '\t' << f.ip << '\t' << f.username << '\n';
-    }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  Settings (auto-connect, etc.)
-// ════════════════════════════════════════════════════════════════
-struct AppSettings {
-    bool auto_connect = false;
-    std::string last_server_ip;
-    std::string last_username;
-};
-
-static std::string get_settings_path() {
-    PWSTR documents = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, documents, -1, nullptr, 0, nullptr, nullptr);
-        std::string path(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, documents, -1, path.data(), len, nullptr, nullptr);
-        CoTaskMemFree(documents);
-
-        path += "\\LilyPad";
-        CreateDirectoryA(path.c_str(), nullptr);
-        return path + "\\settings.txt";
-    }
-    return "";
-}
-
-static AppSettings load_settings() {
-    AppSettings s;
-    std::string path = get_settings_path();
-    if (path.empty()) return s;
-
-    std::ifstream file(path);
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        std::string key = line.substr(0, eq);
-        std::string val = line.substr(eq + 1);
-        if (key == "auto_connect") s.auto_connect = (val == "1");
-        else if (key == "last_server_ip") s.last_server_ip = val;
-        else if (key == "last_username") s.last_username = val;
-    }
-    return s;
-}
-
-static void save_settings(const AppSettings& s) {
-    std::string path = get_settings_path();
-    if (path.empty()) return;
-
-    std::ofstream file(path, std::ios::trunc);
-    file << "auto_connect=" << (s.auto_connect ? "1" : "0") << '\n';
-    file << "last_server_ip=" << s.last_server_ip << '\n';
-    file << "last_username=" << s.last_username << '\n';
-}
-
-// ════════════════════════════════════════════════════════════════
-//  D3D11 globals
-// ════════════════════════════════════════════════════════════════
-static ID3D11Device*           g_d3d_device    = nullptr;
-static ID3D11DeviceContext*    g_d3d_context   = nullptr;
-static IDXGISwapChain*         g_swap_chain    = nullptr;
-static ID3D11RenderTargetView* g_rtv           = nullptr;
-
-static bool CreateD3DDevice(HWND hwnd) {
-    DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount        = 2;
-    sd.BufferDesc.Width   = 0;
-    sd.BufferDesc.Height  = 0;
-    sd.BufferDesc.Format  = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator   = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.OutputWindow       = hwnd;
-    sd.SampleDesc.Count   = 1;
-    sd.SampleDesc.Quality = 0;
-    sd.Windowed           = TRUE;
-    sd.SwapEffect         = DXGI_SWAP_EFFECT_DISCARD;
-
-    D3D_FEATURE_LEVEL level;
-    D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
-
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        levels, 1, D3D11_SDK_VERSION, &sd,
-        &g_swap_chain, &g_d3d_device, &level, &g_d3d_context);
-
-    if (FAILED(hr)) return false;
-
-    ID3D11Texture2D* back_buffer = nullptr;
-    g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    g_d3d_device->CreateRenderTargetView(back_buffer, nullptr, &g_rtv);
-    back_buffer->Release();
-    return true;
-}
-
-static void CleanupD3D() {
-    if (g_rtv)        { g_rtv->Release();        g_rtv = nullptr; }
-    if (g_swap_chain) { g_swap_chain->Release();  g_swap_chain = nullptr; }
-    if (g_d3d_context){ g_d3d_context->Release(); g_d3d_context = nullptr; }
-    if (g_d3d_device) { g_d3d_device->Release();  g_d3d_device = nullptr; }
-}
-
-static void ResizeD3D(UINT width, UINT height) {
-    if (!g_d3d_device || width == 0 || height == 0) return;
-    if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
-    g_swap_chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
-    ID3D11Texture2D* back_buffer = nullptr;
-    g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
-    g_d3d_device->CreateRenderTargetView(back_buffer, nullptr, &g_rtv);
-    back_buffer->Release();
-}
 
 static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
         return true;
 
     switch (msg) {
+    case WM_NCCALCSIZE: {
+        if (wParam == TRUE) {
+            auto& params = *reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            // When maximized, constrain to the monitor working area so we
+            // don't cover the taskbar.
+            if (IsZoomed(hwnd)) {
+                MONITORINFO mi = { sizeof(mi) };
+                GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+                params.rgrc[0] = mi.rcWork;
+            }
+            return 0; // removes the native title bar
+        }
+        break;
+    }
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT rc;
+        GetWindowRect(hwnd, &rc);
+
+        bool maximized = IsZoomed(hwnd);
+
+        // Resize borders (skip when maximized)
+        if (!maximized) {
+            bool left   = pt.x < rc.left   + (int)RESIZE_BORDER;
+            bool right  = pt.x >= rc.right  - (int)RESIZE_BORDER;
+            bool top    = pt.y < rc.top     + (int)RESIZE_BORDER;
+            bool bottom = pt.y >= rc.bottom - (int)RESIZE_BORDER;
+
+            if (top && left)     return HTTOPLEFT;
+            if (top && right)    return HTTOPRIGHT;
+            if (bottom && left)  return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left)            return HTLEFT;
+            if (right)           return HTRIGHT;
+            if (top)             return HTTOP;
+            if (bottom)          return HTBOTTOM;
+        }
+
+        // Title bar area -- enable drag (but not over traffic light buttons)
+        if (pt.y < rc.top + (int)CUSTOM_TITLEBAR_HEIGHT && !g_cursor_on_titlebar) {
+            return HTCAPTION;
+        }
+
+        return HTCLIENT;
+    }
+    case WM_NCACTIVATE:
+        // Prevent default title bar redraw
+        return TRUE;
+    case WM_GETMINMAXINFO: {
+        auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = 700;
+        mmi->ptMinTrackSize.y = 450;
+        return 0;
+    }
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED)
             ResizeD3D(LOWORD(lParam), HIWORD(lParam));
@@ -255,1308 +126,11 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 // ════════════════════════════════════════════════════════════════
-//  Application state
-// ════════════════════════════════════════════════════════════════
-struct UserEntry {
-    uint32_t    id;
-    std::string name;
-    bool        is_sharing = false;
-    bool        in_voice = false;
-};
-
-struct ChatMessage {
-    uint32_t    sender_id;
-    std::string sender_name;
-    std::string text;
-    bool        is_system;
-    uint64_t    seq = 0;
-    int64_t     timestamp = 0;
-};
-
-// Per-user jitter buffer for voice reception
-struct JitterBuffer {
-    std::deque<std::vector<float>> frames;
-    bool primed = false;  // true once pre-buffer threshold reached
-    static constexpr size_t MAX_DEPTH  = 4;  // 80ms max buffering
-    static constexpr size_t PRE_BUFFER = 2;  // 40ms pre-buffer before playback starts
-};
-
-// Item in the screen-share send queue (video frames + system audio)
-struct ScreenSendItem {
-    std::vector<uint8_t> data;    // fully formed TCP message
-    bool                 is_audio; // true = SCREEN_AUDIO, false = SCREEN_FRAME
-};
-
-// ── Chat cache helpers ──
-static std::string get_lilypad_dir() {
-    PWSTR documents = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &documents))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, documents, -1, nullptr, 0, nullptr, nullptr);
-        std::string path(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, documents, -1, path.data(), len, nullptr, nullptr);
-        CoTaskMemFree(documents);
-        path += "\\LilyPad";
-        CreateDirectoryA(path.c_str(), nullptr);
-        return path;
-    }
-    return "";
-}
-
-static std::string get_chat_cache_dir(const std::string& server_ip) {
-    std::string base = get_lilypad_dir();
-    if (base.empty()) return "";
-    std::string cache_dir = base + "\\cache";
-    CreateDirectoryA(cache_dir.c_str(), nullptr);
-    // Sanitize IP for directory name (replace : with _)
-    std::string safe_ip = server_ip;
-    for (char& c : safe_ip) {
-        if (c == ':' || c == '/' || c == '\\') c = '_';
-    }
-    std::string server_dir = cache_dir + "\\" + safe_ip;
-    CreateDirectoryA(server_dir.c_str(), nullptr);
-    return server_dir;
-}
-
-static std::string get_chat_cache_path(const std::string& server_ip) {
-    std::string dir = get_chat_cache_dir(server_ip);
-    if (dir.empty()) return "";
-    return dir + "\\chat.jsonl";
-}
-
-struct AppState {
-    // Connection
-    std::atomic<bool> connected{false};
-    std::atomic<bool> running{true};
-    uint32_t          my_id = 0;
-    std::string       my_username;
-    std::string       server_ip;
-
-    // Voice channel (separate from text chat)
-    std::atomic<bool> in_voice{false};
-
-    // Update notification (from server or background GitHub check)
-    std::mutex              update_mutex;
-    std::string             update_version;
-    std::string             update_url;
-    std::atomic<bool>       update_available{false};
-
-    // Network handles
-    std::unique_ptr<lilypad::Socket> tcp;
-    std::unique_ptr<lilypad::Socket> udp;
-    sockaddr_in                      udp_dest{};
-
-    // User list
-    std::mutex              users_mutex;
-    std::vector<UserEntry>  users;
-
-    // Chat messages
-    std::mutex              chat_mutex;
-    std::vector<ChatMessage> chat_messages;
-    std::atomic<uint64_t>   last_known_seq{0};
-
-    // Per-user volume (client_id → volume 0.0-2.0, default 1.0)
-    std::mutex                           volume_mutex;
-    std::unordered_map<uint32_t, float>  user_volumes;
-
-    // Push-to-talk
-    std::atomic<bool> ptt_enabled{false};
-    std::atomic<int>  ptt_key{0x56};        // default: V key
-    std::atomic<bool> ptt_active{false};     // true when key is held
-
-    // Mute
-    std::atomic<bool> muted{false};
-
-    // Noise suppression (RNNoise)
-    std::atomic<bool> noise_suppression{false};
-
-    // Audio handles
-    std::unique_ptr<lilypad::AudioCapture>  capture;
-    std::unique_ptr<lilypad::AudioPlayback> playback;
-
-    // TCP send mutex (TCP thread reads, UI thread sends chat)
-    std::mutex tcp_send_mutex;
-
-    // Jitter buffers for voice reception (per-user)
-    std::mutex                                              jitter_mutex;
-    std::unordered_map<uint32_t, JitterBuffer>              jitter_buffers;
-    std::unordered_map<uint32_t, lilypad::OpusDecoderWrapper> voice_decoders;
-
-    // Voice activity tracking (per-user, timestamp of last received voice packet)
-    std::mutex                                                             voice_activity_mutex;
-    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>    voice_last_seen;
-
-    // Threads
-    std::unique_ptr<std::thread> tcp_thread;
-    std::unique_ptr<std::thread> send_thread;
-    std::unique_ptr<std::thread> udp_recv_thread;
-    std::unique_ptr<std::thread> playback_thread;
-    std::unique_ptr<std::thread> screen_thread;
-    std::unique_ptr<std::thread> sys_audio_thread;
-
-    // System audio playback (received from screen sharer)
-    std::mutex                             sys_audio_mutex;
-    std::deque<std::vector<float>>         sys_audio_frames;
-    std::unique_ptr<lilypad::OpusDecoderWrapper> sys_audio_decoder;
-    float                                  stream_volume = 1.0f;  // 0.0–1.0
-
-    // Screen send queue — decouples capture/encode from TCP sending
-    std::mutex                          screen_send_mutex;
-    std::condition_variable             screen_send_cv;
-    std::deque<ScreenSendItem>          screen_send_queue;
-    std::unique_ptr<std::thread>        screen_send_thread;
-
-    // Screen sharing — outgoing (this client is sharing)
-    std::atomic<bool> screen_sharing{false};
-
-    // Screen sharing — incoming (watching another client)
-    std::atomic<uint32_t> watching_user_id{0};      // 0 = not watching
-    std::mutex            screen_frame_mutex;
-    std::vector<uint8_t>  screen_frame_buf;          // H.264 data from network
-    uint8_t               screen_frame_flags = 0;    // flags byte from protocol
-    bool                  screen_frame_new   = false;
-
-    // H.264 decode thread (produces SRV directly via decoder)
-    std::condition_variable screen_decode_cv;
-    std::unique_ptr<std::thread> screen_decode_thread;
-
-    // H.264 decoder output SRV (set by decode thread, read by main thread)
-    std::mutex                    screen_srv_mutex;
-    ID3D11ShaderResourceView*     screen_srv       = nullptr;  // not owned — decoder owns it
-    int                           screen_srv_w     = 0;
-    int                           screen_srv_h     = 0;
-
-    // Keyframe request from server
-    std::atomic<bool> force_keyframe{false};
-    std::atomic<int>  h264_bitrate{0};  // 0 = auto (set based on resolution)
-
-    void add_system_msg(const std::string& text) {
-        std::lock_guard<std::mutex> lk(chat_mutex);
-        chat_messages.push_back({0, "", text, true, 0, 0});
-        if (chat_messages.size() > 5000)
-            chat_messages.erase(chat_messages.begin());
-    }
-
-    void add_chat_msg(uint32_t sender_id, const std::string& name, const std::string& text,
-                      uint64_t seq = 0, int64_t timestamp = 0) {
-        std::lock_guard<std::mutex> lk(chat_mutex);
-        chat_messages.push_back({sender_id, name, text, false, seq, timestamp});
-        if (chat_messages.size() > 5000)
-            chat_messages.erase(chat_messages.begin());
-    }
-
-    float get_volume(uint32_t client_id) {
-        std::lock_guard<std::mutex> lk(volume_mutex);
-        auto it = user_volumes.find(client_id);
-        if (it != user_volumes.end()) return it->second;
-        return 1.0f;
-    }
-
-    void set_volume(uint32_t client_id, float vol) {
-        std::lock_guard<std::mutex> lk(volume_mutex);
-        user_volumes[client_id] = vol;
-    }
-
-    void send_tcp(const std::vector<uint8_t>& data) {
-        std::lock_guard<std::mutex> lk(tcp_send_mutex);
-        if (tcp && tcp->valid()) tcp->send_all(data);
-    }
-
-    std::string lookup_username(uint32_t uid) {
-        std::lock_guard<std::mutex> lk(users_mutex);
-        for (auto& u : users)
-            if (u.id == uid) return u.name;
-        return "User #" + std::to_string(uid);
-    }
-};
-
-// ════════════════════════════════════════════════════════════════
-//  Background update check (GitHub)
-// ════════════════════════════════════════════════════════════════
-static void check_for_update_thread(AppState& app) {
-    HINTERNET inet = InternetOpenA("LilyPad", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (!inet) return;
-
-    HINTERNET url = InternetOpenUrlA(inet, UPDATE_CHECK_URL, nullptr, 0,
-        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
-    if (!url) {
-        InternetCloseHandle(inet);
-        return;
-    }
-
-    // Read response (version.txt is tiny — a few hundred bytes at most)
-    std::string body;
-    char buf[1024];
-    DWORD bytes_read = 0;
-    while (InternetReadFile(url, buf, sizeof(buf), &bytes_read) && bytes_read > 0) {
-        body.append(buf, bytes_read);
-        if (body.size() > 4096) break; // safety limit
-    }
-
-    InternetCloseHandle(url);
-    InternetCloseHandle(inet);
-
-    if (body.empty()) return;
-
-    // Parse: line 1 = version, line 2 = download URL
-    auto nl = body.find('\n');
-    if (nl == std::string::npos) return;
-
-    std::string version = body.substr(0, nl);
-    // Trim carriage return if present
-    if (!version.empty() && version.back() == '\r') version.pop_back();
-
-    std::string dl_url = body.substr(nl + 1);
-    // Trim trailing whitespace/newlines
-    while (!dl_url.empty() && (dl_url.back() == '\r' || dl_url.back() == '\n' || dl_url.back() == ' '))
-        dl_url.pop_back();
-
-    if (version.empty() || dl_url.empty()) return;
-
-    if (is_newer_version(APP_VERSION, version)) {
-        std::lock_guard<std::mutex> lk(app.update_mutex);
-        app.update_version = version;
-        app.update_url     = dl_url;
-        app.update_available = true;
-    }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  Network threads
-// ════════════════════════════════════════════════════════════════
-
-// ── Screen decode thread: decodes H.264→RGBA via Media Foundation ──
-static void screen_decode_thread_func(AppState& app) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-    lilypad::H264Decoder decoder;
-    if (!decoder.init(g_d3d_device)) {
-        app.add_system_msg("H.264 decoder init failed");
-        CoUninitialize();
-        return;
-    }
-
-    int frames_received = 0;
-    int frames_decoded = 0;
-
-    while (app.running && app.connected) {
-        std::vector<uint8_t> frame_copy;
-        uint8_t flags = 0;
-        {
-            std::unique_lock<std::mutex> lk(app.screen_frame_mutex);
-            app.screen_decode_cv.wait_for(lk, std::chrono::milliseconds(5),
-                [&] { return app.screen_frame_new || !app.connected || !app.running; });
-            if (!app.connected || !app.running) break;
-            if (!app.screen_frame_new || app.screen_frame_buf.empty()) continue;
-            frame_copy.swap(app.screen_frame_buf);
-            flags = app.screen_frame_flags;
-            app.screen_frame_new = false;
-        }
-
-        frames_received++;
-        bool is_keyframe = (flags & lilypad::SCREEN_FLAG_KEYFRAME) != 0;
-
-        if (frames_received <= 3) {
-            char msg[128];
-            snprintf(msg, sizeof(msg), "[Viewer] Frame #%d: %zu bytes, flags=0x%02X%s",
-                     frames_received, frame_copy.size(), flags, is_keyframe ? " (IDR)" : "");
-            app.add_system_msg(msg);
-        }
-
-        if (decoder.decode(frame_copy.data(), frame_copy.size(), is_keyframe)) {
-            frames_decoded++;
-            std::lock_guard<std::mutex> lk(app.screen_srv_mutex);
-            app.screen_srv   = decoder.get_output_srv();
-            app.screen_srv_w = decoder.width();
-            app.screen_srv_h = decoder.height();
-
-            if (frames_decoded <= 3) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "[Viewer] Decoded #%d: %dx%d, SRV=%s",
-                         frames_decoded, decoder.width(), decoder.height(),
-                         decoder.get_output_srv() ? "OK" : "null");
-                app.add_system_msg(msg);
-            }
-        } else if (frames_received <= 5) {
-            app.add_system_msg("[Viewer] Decode failed for frame #" + std::to_string(frames_received));
-        }
-    }
-
-    decoder.flush();
-    decoder.shutdown();
-    CoUninitialize();
-}
-
-// ── Screen send thread: drains queue with audio priority, drops stale video frames ──
-static void screen_send_thread_func(AppState& app) {
-    while (app.running && app.connected && app.screen_sharing) {
-        std::deque<ScreenSendItem> batch;
-        {
-            std::unique_lock<std::mutex> lk(app.screen_send_mutex);
-            app.screen_send_cv.wait_for(lk, std::chrono::milliseconds(5),
-                [&] { return !app.screen_send_queue.empty() || !app.screen_sharing; });
-            batch.swap(app.screen_send_queue);
-        }
-
-        if (batch.empty()) continue;
-
-        // Send ALL audio items first (small packets, latency-sensitive)
-        for (auto& item : batch) {
-            if (item.is_audio) {
-                app.send_tcp(item.data);
-            }
-        }
-
-        // Send only the NEWEST video frame (drop older ones to prevent queue buildup)
-        for (auto it = batch.rbegin(); it != batch.rend(); ++it) {
-            if (!it->is_audio) {
-                app.send_tcp(it->data);
-                break;
-            }
-        }
-    }
-}
-
-// ── Screen capture thread (runs while this client is sharing) ──
-static void screen_capture_thread_func(AppState& app) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-    using clock = std::chrono::steady_clock;
-    auto next_frame = clock::now();
-
-    lilypad::ScreenCapturer capturer;
-
-    if (!capturer.get_device()) {
-        app.add_system_msg("Screen capture init failed (no D3D11 device)");
-        CoUninitialize();
-        return;
-    }
-
-    // Encode at native capture resolution, 30fps (bitrate controls quality)
-    constexpr int fps_val = 30;
-    constexpr int interval_ms = 33;
-    int enc_w = capturer.screen_width() & ~1;
-    int enc_h = capturer.screen_height() & ~1;
-
-    // Auto bitrate based on resolution
-    int bitrate = app.h264_bitrate.load();
-    if (bitrate <= 0) {
-        int pixels = enc_w * enc_h;
-        if (pixels >= 3686400)       bitrate = 30000000;  // 2560x1440+: 30 Mbps
-        else if (pixels >= 2073600)  bitrate = 18000000;  // 1920x1080:  18 Mbps
-        else if (pixels >= 921600)   bitrate = 10000000;  // 1280x720:   10 Mbps
-        else                         bitrate = 6000000;   // smaller:    6 Mbps
-        app.h264_bitrate.store(bitrate);
-    }
-
-    lilypad::H264Encoder encoder;
-    if (!encoder.init(capturer.get_device(), enc_w, enc_h, fps_val, bitrate)) {
-        app.add_system_msg("H.264 encoder init failed");
-        CoUninitialize();
-        return;
-    }
-
-    int cap_frame = 0;
-    while (app.running && app.connected && app.screen_sharing) {
-        next_frame += std::chrono::milliseconds(interval_ms);
-
-        // Skip this frame if a video frame is still queued (sender can't keep up)
-        {
-            std::lock_guard<std::mutex> lk(app.screen_send_mutex);
-            bool has_pending_frame = false;
-            for (auto& item : app.screen_send_queue) {
-                if (!item.is_audio) { has_pending_frame = true; break; }
-            }
-            if (has_pending_frame) {
-                auto now = clock::now();
-                if (next_frame > now)
-                    std::this_thread::sleep_until(next_frame);
-                else
-                    next_frame = now;
-                continue;
-            }
-        }
-
-        // Update bitrate if changed
-        int new_bitrate = app.h264_bitrate.load();
-        if (new_bitrate != bitrate) {
-            bitrate = new_bitrate;
-            encoder.set_bitrate(bitrate);
-        }
-
-        int w = 0, h = 0;
-        auto* tex = capturer.capture_texture(w, h);
-
-        cap_frame++;
-
-        if (tex) {
-            bool force_idr = app.force_keyframe.exchange(false);
-            bool is_keyframe = false;
-            auto h264 = encoder.encode(tex, force_idr, is_keyframe);
-
-            if (!h264.empty()) {
-                uint8_t flags = is_keyframe ? lilypad::SCREEN_FLAG_KEYFRAME : 0;
-                auto msg = lilypad::make_screen_frame_msg(
-                    static_cast<uint16_t>(enc_w), static_cast<uint16_t>(enc_h),
-                    flags, h264.data(), h264.size());
-
-                {
-                    std::lock_guard<std::mutex> lk(app.screen_send_mutex);
-                    app.screen_send_queue.push_back({std::move(msg), false});
-                }
-                app.screen_send_cv.notify_one();
-            } else if (cap_frame <= 10) {
-                char dbg[128];
-                snprintf(dbg, sizeof(dbg), "[CapThread] Frame %d: encode returned empty\n", cap_frame);
-                OutputDebugStringA(dbg);
-            }
-        } else if (cap_frame <= 10) {
-            char dbg[128];
-            snprintf(dbg, sizeof(dbg), "[CapThread] Frame %d: capture_texture returned null\n", cap_frame);
-            OutputDebugStringA(dbg);
-        }
-
-        // Sleep until next frame time; if we're behind, reset to now
-        auto now = clock::now();
-        if (next_frame > now) {
-            std::this_thread::sleep_until(next_frame);
-        } else {
-            next_frame = now;
-        }
-    }
-
-    {
-        char dbg[128];
-        snprintf(dbg, sizeof(dbg), "[CapThread] Exiting: running=%d connected=%d sharing=%d frames=%d\n",
-                 (int)app.running.load(), (int)app.connected.load(), (int)app.screen_sharing.load(), cap_frame);
-        OutputDebugStringA(dbg);
-    }
-    CoUninitialize();
-}
-
-// ── System audio capture thread (runs alongside screen sharing) ──
-static void sys_audio_capture_thread_func(AppState& app) {
-    try {
-        SystemAudioCapture capture;
-
-        if (!capture.is_initialized()) {
-            app.add_system_msg("System audio capture failed to initialize.");
-            return;
-        }
-        if (capture.excludes_self()) {
-            app.add_system_msg("System audio: capturing (LilyPad audio excluded).");
-        } else {
-            app.add_system_msg("System audio: fallback mode (LilyPad audio may be included).");
-        }
-
-        lilypad::OpusEncoderWrapper encoder;
-
-        // Accumulate mono samples until we have a full 960-sample (20ms) frame
-        std::vector<float> accum;
-        accum.reserve(lilypad::FRAME_SIZE * 2);
-
-        while (app.running && app.connected && app.screen_sharing) {
-            auto samples = capture.read_samples();
-            if (!samples.empty()) {
-                accum.insert(accum.end(), samples.begin(), samples.end());
-            }
-
-            // Encode and send complete frames
-            while (accum.size() >= static_cast<size_t>(lilypad::FRAME_SIZE)) {
-                auto opus_data = encoder.encode(accum.data(), lilypad::FRAME_SIZE);
-                accum.erase(accum.begin(), accum.begin() + lilypad::FRAME_SIZE);
-
-                auto msg = lilypad::make_screen_audio_msg(opus_data.data(), opus_data.size());
-                {
-                    std::lock_guard<std::mutex> lk(app.screen_send_mutex);
-                    app.screen_send_queue.push_back({std::move(msg), true});
-                }
-                app.screen_send_cv.notify_one();
-            }
-
-            // Sleep briefly if no data was available
-            if (samples.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            }
-        }
-    } catch (...) {
-        // System audio capture failed — silently stop
-    }
-}
-
-static void tcp_receive_thread(AppState& app) {
-    while (app.running && app.connected) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(app.tcp->get(), &read_set);
-
-        timeval timeout{};
-        timeout.tv_sec  = 0;
-        timeout.tv_usec = 200000;
-
-        int ready = select(0, &read_set, nullptr, nullptr, &timeout);
-        if (ready <= 0) continue;
-
-        uint8_t hdr[lilypad::SIGNAL_HEADER_SIZE];
-        if (!app.tcp->recv_all(hdr, lilypad::SIGNAL_HEADER_SIZE)) {
-            app.add_system_msg("Disconnected from server.");
-            app.connected = false;
-            break;
-        }
-
-        auto header = lilypad::deserialize_header(hdr);
-
-        std::vector<uint8_t> payload;
-        if (header.payload_len > 0) {
-            payload.resize(header.payload_len);
-            if (!app.tcp->recv_all(payload.data(), header.payload_len)) {
-                app.connected = false;
-                break;
-            }
-        }
-
-        switch (header.type) {
-        case lilypad::MsgType::USER_JOINED: {
-            uint32_t uid = lilypad::read_u32(payload.data());
-            std::string name(reinterpret_cast<const char*>(payload.data() + 4));
-            {
-                std::lock_guard<std::mutex> lk(app.users_mutex);
-                app.users.push_back({uid, name});
-            }
-            app.add_system_msg(name + " joined.");
-            break;
-        }
-        case lilypad::MsgType::USER_LEFT: {
-            uint32_t uid = lilypad::read_u32(payload.data());
-            std::string name;
-            {
-                std::lock_guard<std::mutex> lk(app.users_mutex);
-                auto it = std::find_if(app.users.begin(), app.users.end(),
-                    [uid](const UserEntry& u) { return u.id == uid; });
-                if (it != app.users.end()) {
-                    name = it->name;
-                    app.users.erase(it);
-                }
-            }
-            {
-                std::lock_guard<std::mutex> lk(app.volume_mutex);
-                app.user_volumes.erase(uid);
-            }
-            // If we were watching this user, stop
-            if (app.watching_user_id.load() == uid) {
-                app.watching_user_id = 0;
-            }
-            app.add_system_msg((name.empty() ? "User #" + std::to_string(uid) : name) + " left.");
-            break;
-        }
-        case lilypad::MsgType::TEXT_CHAT: {
-            // v2 format: seq(8) + client_id(4) + timestamp(8) + sender_name\0 + text\0
-            if (payload.size() > 20) {
-                uint64_t seq = lilypad::read_u64(payload.data());
-                uint32_t uid = lilypad::read_u32(payload.data() + 8);
-                int64_t ts   = static_cast<int64_t>(lilypad::read_u64(payload.data() + 12));
-                // Find sender_name (null-terminated starting at offset 20)
-                const char* p = reinterpret_cast<const char*>(payload.data() + 20);
-                std::string sender_name(p);
-                size_t text_offset = 20 + sender_name.size() + 1;
-                std::string text;
-                if (text_offset < payload.size()) {
-                    text = std::string(reinterpret_cast<const char*>(payload.data() + text_offset));
-                }
-                // Skip if already in cache
-                if (seq <= app.last_known_seq.load()) break;
-                app.add_chat_msg(uid, sender_name, text, seq, ts);
-                app.last_known_seq = seq;
-                // Append to local cache
-                std::string cache_path = get_chat_cache_path(app.server_ip);
-                if (!cache_path.empty()) {
-                    std::ofstream cf(cache_path, std::ios::app);
-                    if (cf.is_open()) {
-                        cf << lilypad::serialize_chat_line(seq, sender_name, ts, text) << '\n';
-                    }
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::VOICE_JOINED: {
-            if (payload.size() >= 4) {
-                uint32_t uid = lilypad::read_u32(payload.data());
-                std::lock_guard<std::mutex> lk(app.users_mutex);
-                for (auto& u : app.users) {
-                    if (u.id == uid) { u.in_voice = true; break; }
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::VOICE_LEFT: {
-            if (payload.size() >= 4) {
-                uint32_t uid = lilypad::read_u32(payload.data());
-                std::lock_guard<std::mutex> lk(app.users_mutex);
-                for (auto& u : app.users) {
-                    if (u.id == uid) { u.in_voice = false; break; }
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::SCREEN_START: {
-            if (payload.size() >= 4) {
-                uint32_t uid = lilypad::read_u32(payload.data());
-                std::lock_guard<std::mutex> lk(app.users_mutex);
-                for (auto& u : app.users) {
-                    if (u.id == uid) { u.is_sharing = true; break; }
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::SCREEN_STOP: {
-            if (payload.size() >= 4) {
-                uint32_t uid = lilypad::read_u32(payload.data());
-                {
-                    std::lock_guard<std::mutex> lk(app.users_mutex);
-                    for (auto& u : app.users) {
-                        if (u.id == uid) { u.is_sharing = false; break; }
-                    }
-                }
-                // If we were watching this user, stop
-                if (app.watching_user_id.load() == uid) {
-                    app.watching_user_id = 0;
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::SCREEN_FRAME: {
-            // Server relay: sharer_id(4) + width(2) + height(2) + flags(1) + h264_data
-            if (payload.size() >= 9) {
-                uint32_t sharer_id = lilypad::read_u32(payload.data());
-                if (sharer_id == app.watching_user_id.load()) {
-                    uint8_t flags = payload[8];
-                    const uint8_t* frame_data = payload.data() + 9;
-                    size_t frame_len = payload.size() - 9;
-
-                    {
-                        std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-                        app.screen_frame_buf.assign(frame_data, frame_data + frame_len);
-                        app.screen_frame_flags = flags;
-                        app.screen_frame_new = true;
-                    }
-                    app.screen_decode_cv.notify_one();
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::SCREEN_AUDIO: {
-            // Server relay: sharer_id(4) + opus_data
-            if (payload.size() > 4) {
-                uint32_t sharer_id = lilypad::read_u32(payload.data());
-                if (sharer_id == app.watching_user_id.load()) {
-                    const uint8_t* opus_data = payload.data() + 4;
-                    int opus_len = static_cast<int>(payload.size() - 4);
-
-                    std::lock_guard<std::mutex> lk(app.sys_audio_mutex);
-                    // Create decoder on first use
-                    if (!app.sys_audio_decoder) {
-                        app.sys_audio_decoder = std::make_unique<lilypad::OpusDecoderWrapper>();
-                    }
-                    try {
-                        auto pcm = app.sys_audio_decoder->decode(opus_data, opus_len);
-                        app.sys_audio_frames.push_back(std::move(pcm));
-                        // Limit buffer depth to prevent unbounded growth
-                        while (app.sys_audio_frames.size() > 8) {
-                            app.sys_audio_frames.pop_front();
-                        }
-                    } catch (...) {}
-                }
-            }
-            break;
-        }
-        case lilypad::MsgType::SCREEN_REQUEST_KEYFRAME: {
-            // Server requests that we produce an IDR keyframe
-            app.force_keyframe = true;
-            break;
-        }
-        case lilypad::MsgType::UPDATE_AVAILABLE: {
-            // Server sends: version\0url\0
-            if (payload.size() >= 3) {
-                const char* p = reinterpret_cast<const char*>(payload.data());
-                std::string version(p);
-                size_t url_offset = version.size() + 1;
-                if (url_offset < payload.size()) {
-                    std::string url(p + url_offset);
-                    if (!version.empty() && !url.empty() && is_newer_version(APP_VERSION, version)) {
-                        std::lock_guard<std::mutex> lk(app.update_mutex);
-                        app.update_version = version;
-                        app.update_url     = url;
-                        app.update_available = true;
-                    }
-                }
-            }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-}
-
-static void voice_send_thread(AppState& app) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    lilypad::OpusEncoderWrapper encoder;
-    uint32_t sequence = 0;
-
-    // RNNoise state — created once, reused for the lifetime of the thread
-    DenoiseState* rnn_st = rnnoise_create(nullptr);
-    const int rnn_frame = 480; // rnnoise processes 480 samples at a time
-
-    while (app.running && app.connected && app.in_voice) {
-        try {
-            auto pcm = app.capture->read_frame();
-
-            // Mute or push-to-talk: determine if we should transmit
-            bool should_transmit = !app.muted.load();
-            if (should_transmit && app.ptt_enabled) {
-                should_transmit = app.ptt_active.load();
-            }
-
-            if (!should_transmit) {
-                // Still read from mic to keep stream flowing, but don't send
-                continue;
-            }
-
-            // Apply RNNoise noise suppression if enabled
-            if (app.noise_suppression.load()) {
-                // RNNoise expects float samples in [-32768, 32768] range
-                // Our PCM is in [-1.0, 1.0] (PortAudio float format)
-                // Process two 480-sample sub-frames (our frame is 960 samples)
-                std::vector<float> rnn_buf(rnn_frame);
-                for (int sub = 0; sub < 2; ++sub) {
-                    // Scale up to rnnoise range
-                    for (int i = 0; i < rnn_frame; ++i) {
-                        rnn_buf[i] = pcm[sub * rnn_frame + i] * 32768.0f;
-                    }
-                    rnnoise_process_frame(rnn_st, rnn_buf.data(), rnn_buf.data());
-                    // Scale back to [-1.0, 1.0]
-                    for (int i = 0; i < rnn_frame; ++i) {
-                        pcm[sub * rnn_frame + i] = rnn_buf[i] / 32768.0f;
-                    }
-                }
-            }
-
-            auto opus_data = encoder.encode(pcm.data());
-
-            lilypad::VoicePacket pkt;
-            pkt.client_id = app.my_id;
-            pkt.sequence  = sequence++;
-            pkt.opus_data = std::move(opus_data);
-
-            auto bytes = pkt.to_bytes();
-            sendto(app.udp->get(), reinterpret_cast<const char*>(bytes.data()),
-                   static_cast<int>(bytes.size()), 0,
-                   reinterpret_cast<const sockaddr*>(&app.udp_dest),
-                   sizeof(app.udp_dest));
-        } catch (...) {
-            break;
-        }
-    }
-
-    if (rnn_st) rnnoise_destroy(rnn_st);
-}
-
-// ── UDP receive thread: reads UDP packets, decodes Opus, pushes into per-user jitter buffers ──
-static void udp_receive_thread_func(AppState& app) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    uint8_t buf[lilypad::MAX_VOICE_PACKET];
-
-    while (app.running && app.connected && app.in_voice) {
-        fd_set read_set;
-        FD_ZERO(&read_set);
-        FD_SET(app.udp->get(), &read_set);
-
-        timeval timeout{};
-        timeout.tv_sec  = 0;
-        timeout.tv_usec = 20000; // 20ms
-
-        int ready = select(0, &read_set, nullptr, nullptr, &timeout);
-        if (ready <= 0) continue;
-
-        // Read all available UDP packets
-        while (true) {
-            sockaddr_in sender{};
-            int sender_len = sizeof(sender);
-            int received = recvfrom(app.udp->get(), reinterpret_cast<char*>(buf), sizeof(buf), 0,
-                                    reinterpret_cast<sockaddr*>(&sender), &sender_len);
-            if (received < static_cast<int>(lilypad::VOICE_HEADER_SIZE)) break;
-
-            auto pkt = lilypad::VoicePacket::from_bytes(buf, static_cast<size_t>(received));
-
-            // Record voice activity for talking indicator
-            {
-                std::lock_guard<std::mutex> lk(app.voice_activity_mutex);
-                app.voice_last_seen[pkt.client_id] = std::chrono::steady_clock::now();
-            }
-
-            std::lock_guard<std::mutex> lk(app.jitter_mutex);
-            // Get or create decoder for this user
-            auto [dec_it, dec_inserted] = app.voice_decoders.try_emplace(pkt.client_id);
-            auto pcm = dec_it->second.decode(pkt.opus_data.data(),
-                                              static_cast<int>(pkt.opus_data.size()));
-
-            // Push into jitter buffer
-            auto& jb = app.jitter_buffers[pkt.client_id];
-            jb.frames.push_back(std::move(pcm));
-            // Discard oldest if exceeded max depth to prevent latency buildup
-            while (jb.frames.size() > JitterBuffer::MAX_DEPTH) {
-                jb.frames.pop_front();
-            }
-
-            // Check if more data is available
-            fd_set peek_set;
-            FD_ZERO(&peek_set);
-            FD_SET(app.udp->get(), &peek_set);
-            timeval zero_tv{0, 0};
-            if (select(0, &peek_set, nullptr, nullptr, &zero_tv) <= 0) break;
-        }
-    }
-}
-
-// ── Audio playback thread: hardware-paced, drains jitter buffers, mixes, writes ──
-static void audio_playback_thread_func(AppState& app) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    const size_t frame_len = lilypad::FRAME_SIZE * lilypad::CHANNELS;
-
-    while (app.running && app.connected && app.in_voice) {
-        std::vector<float> mixed(frame_len, 0.0f);
-
-        {
-            std::lock_guard<std::mutex> lk(app.jitter_mutex);
-
-            // Collect IDs to remove stale buffers later
-            std::vector<uint32_t> empty_ids;
-
-            for (auto& [uid, jb] : app.jitter_buffers) {
-                // Pre-buffer: wait until we have enough frames before starting playback
-                if (!jb.primed) {
-                    if (jb.frames.size() >= JitterBuffer::PRE_BUFFER) {
-                        jb.primed = true;
-                    } else {
-                        continue; // still buffering
-                    }
-                }
-
-                std::vector<float> pcm;
-                if (!jb.frames.empty()) {
-                    pcm = std::move(jb.frames.front());
-                    jb.frames.pop_front();
-                } else {
-                    // Buffer underrun — use Opus PLC for interpolated audio
-                    auto dec_it = app.voice_decoders.find(uid);
-                    if (dec_it != app.voice_decoders.end()) {
-                        pcm = dec_it->second.decode_plc();
-                    }
-                    // Reset primed so we re-buffer on next burst of packets
-                    jb.primed = false;
-                }
-
-                if (pcm.empty()) continue;
-
-                float vol = app.get_volume(uid);
-                for (size_t i = 0; i < frame_len && i < pcm.size(); ++i) {
-                    mixed[i] += pcm[i] * vol;
-                }
-            }
-        }
-
-        // Mix in system audio from screen sharing (if any)
-        {
-            std::lock_guard<std::mutex> lk(app.sys_audio_mutex);
-            if (!app.sys_audio_frames.empty()) {
-                float vol = app.stream_volume;
-                auto& sa = app.sys_audio_frames.front();
-                for (size_t i = 0; i < frame_len && i < sa.size(); ++i) {
-                    mixed[i] += sa[i] * vol;
-                }
-                app.sys_audio_frames.pop_front();
-            }
-        }
-
-        // Clamp
-        for (float& s : mixed) {
-            s = std::clamp(s, -1.0f, 1.0f);
-        }
-
-        try {
-            // Blocking write — paces this thread at hardware rate (~20ms)
-            app.playback->write_frame(mixed);
-        } catch (...) { break; }
-    }
-}
-
-// ════════════════════════════════════════════════════════════════
-//  Connect / Disconnect
-// ════════════════════════════════════════════════════════════════
-
-// Forward declarations for voice join/leave
-static void do_join_voice(AppState& app, int input_device, int output_device);
-static void do_leave_voice(AppState& app);
-
-static void do_connect(AppState& app, const std::string& server_ip, const std::string& username) {
-    try {
-        auto tcp = std::make_unique<lilypad::Socket>(lilypad::create_tcp_socket());
-
-        // Disable Nagle's algorithm for low-latency sends
-        int nodelay = 1;
-        setsockopt(tcp->get(), IPPROTO_TCP, TCP_NODELAY,
-                   reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-
-        // Large send buffer so screen frame sends don't block the tcp_send_mutex
-        int sndbuf = 1024 * 1024; // 1MB
-        setsockopt(tcp->get(), SOL_SOCKET, SO_SNDBUF,
-                   reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
-
-        sockaddr_in server_addr{};
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port   = htons(7777);
-        inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr);
-
-        if (connect(tcp->get(), reinterpret_cast<sockaddr*>(&server_addr),
-                    sizeof(server_addr)) == SOCKET_ERROR) {
-            app.add_system_msg("Failed to connect: error " + std::to_string(WSAGetLastError()));
-            return;
-        }
-
-        auto join_msg = lilypad::make_join_msg(username);
-        tcp->send_all(join_msg);
-
-        uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
-        if (!tcp->recv_all(hdr_buf, lilypad::SIGNAL_HEADER_SIZE)) {
-            app.add_system_msg("Failed to receive welcome.");
-            return;
-        }
-        auto welcome_hdr = lilypad::deserialize_header(hdr_buf);
-        if (welcome_hdr.type != lilypad::MsgType::WELCOME) {
-            app.add_system_msg("Unexpected response from server.");
-            return;
-        }
-
-        std::vector<uint8_t> welcome_payload(welcome_hdr.payload_len);
-        if (!tcp->recv_all(welcome_payload.data(), welcome_hdr.payload_len)) {
-            app.add_system_msg("Failed to receive welcome payload.");
-            return;
-        }
-
-        uint32_t my_id    = lilypad::read_u32(welcome_payload.data());
-        uint16_t udp_port = lilypad::read_u16(welcome_payload.data() + 4);
-
-        auto udp = std::make_unique<lilypad::Socket>(lilypad::create_udp_socket());
-
-        sockaddr_in udp_dest{};
-        udp_dest.sin_family = AF_INET;
-        udp_dest.sin_port   = htons(udp_port);
-        inet_pton(AF_INET, server_ip.c_str(), &udp_dest.sin_addr);
-
-        app.tcp      = std::move(tcp);
-        app.udp      = std::move(udp);
-        app.udp_dest = udp_dest;
-        app.my_id    = my_id;
-        app.my_username = username;
-        app.server_ip = server_ip;
-        app.in_voice = false;
-
-        {
-            std::lock_guard<std::mutex> lk(app.users_mutex);
-            app.users.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lk(app.volume_mutex);
-            app.user_volumes.clear();
-        }
-
-        // Reset jitter buffers
-        {
-            std::lock_guard<std::mutex> lk(app.jitter_mutex);
-            app.jitter_buffers.clear();
-            app.voice_decoders.clear();
-        }
-
-        // Reset screen sharing state
-        app.screen_sharing = false;
-        app.watching_user_id = 0;
-        app.force_keyframe = false;
-        {
-            std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-            app.screen_frame_buf.clear();
-            app.screen_frame_flags = 0;
-            app.screen_frame_new = false;
-        }
-
-        // Load chat cache from disk
-        app.last_known_seq = 0;
-        {
-            std::lock_guard<std::mutex> lk(app.chat_mutex);
-            app.chat_messages.clear();
-        }
-        std::string cache_path = get_chat_cache_path(server_ip);
-        if (!cache_path.empty()) {
-            std::ifstream cf(cache_path);
-            std::string line;
-            while (std::getline(cf, line)) {
-                if (line.empty()) continue;
-                auto entry = lilypad::parse_chat_line(line);
-                if (!entry.valid) continue;
-                app.add_chat_msg(0, entry.sender, entry.text, entry.seq, entry.timestamp);
-                if (entry.seq > app.last_known_seq.load())
-                    app.last_known_seq = entry.seq;
-            }
-        }
-
-        app.connected = true;
-        app.add_system_msg("Connected! Your ID: " + std::to_string(my_id));
-
-        // Send CHAT_SYNC to get messages newer than our cache
-        auto sync_msg = lilypad::make_chat_sync_msg(app.last_known_seq.load());
-        app.send_tcp(sync_msg);
-
-        // Start TCP receive and screen decode threads only (voice threads start on Join Voice)
-        app.tcp_thread = std::make_unique<std::thread>(tcp_receive_thread, std::ref(app));
-        app.screen_decode_thread = std::make_unique<std::thread>(screen_decode_thread_func, std::ref(app));
-
-    } catch (const std::exception& e) {
-        app.add_system_msg(std::string("Connection error: ") + e.what());
-    }
-}
-
-static void do_join_voice(AppState& app, int input_device, int output_device) {
-    if (!app.connected || app.in_voice) return;
-    try {
-        app.capture = std::make_unique<lilypad::AudioCapture>(
-            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, input_device);
-        app.playback = std::make_unique<lilypad::AudioPlayback>(
-            lilypad::SAMPLE_RATE, lilypad::CHANNELS, lilypad::FRAME_SIZE, output_device);
-
-        app.in_voice = true;
-        app.send_tcp(lilypad::make_voice_join_msg());
-
-        app.send_thread     = std::make_unique<std::thread>(voice_send_thread, std::ref(app));
-        app.udp_recv_thread = std::make_unique<std::thread>(udp_receive_thread_func, std::ref(app));
-        app.playback_thread = std::make_unique<std::thread>(audio_playback_thread_func, std::ref(app));
-    } catch (const std::exception& e) {
-        app.in_voice = false;
-        app.add_system_msg(std::string("Failed to join voice: ") + e.what());
-    }
-}
-
-static void do_leave_voice(AppState& app) {
-    if (!app.in_voice) return;
-
-    app.in_voice = false;
-    if (app.connected) {
-        app.send_tcp(lilypad::make_voice_leave_msg());
-    }
-
-    // Close UDP to unblock recv thread, then join voice threads
-    if (app.udp) app.udp->close();
-
-    if (app.send_thread && app.send_thread->joinable()) app.send_thread->join();
-    if (app.udp_recv_thread && app.udp_recv_thread->joinable()) app.udp_recv_thread->join();
-    if (app.playback_thread && app.playback_thread->joinable()) app.playback_thread->join();
-
-    app.send_thread.reset();
-    app.udp_recv_thread.reset();
-    app.playback_thread.reset();
-    app.capture.reset();
-    app.playback.reset();
-
-    // Clear jitter buffers
-    {
-        std::lock_guard<std::mutex> lk(app.jitter_mutex);
-        app.jitter_buffers.clear();
-        app.voice_decoders.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lk(app.voice_activity_mutex);
-        app.voice_last_seen.clear();
-    }
-
-    // Recreate UDP socket for potential rejoin
-    if (app.connected) {
-        try {
-            app.udp = std::make_unique<lilypad::Socket>(lilypad::create_udp_socket());
-        } catch (...) {}
-    }
-}
-
-static void do_disconnect(AppState& app) {
-    if (!app.connected) return;
-
-    // Leave voice if active
-    if (app.in_voice) {
-        do_leave_voice(app);
-    }
-
-    // Stop screen sharing if active
-    app.screen_sharing = false;
-    app.screen_send_cv.notify_all();   // wake send thread to exit
-    app.screen_decode_cv.notify_all(); // wake decode thread to exit
-    app.watching_user_id = 0;
-
-    try {
-        auto leave = lilypad::make_leave_msg();
-        app.send_tcp(leave);
-    } catch (...) {}
-
-    app.connected = false;
-
-    if (app.tcp) app.tcp->close();
-    if (app.udp) app.udp->close();
-
-    if (app.tcp_thread  && app.tcp_thread->joinable())  app.tcp_thread->join();
-    if (app.screen_thread && app.screen_thread->joinable()) app.screen_thread->join();
-    if (app.sys_audio_thread && app.sys_audio_thread->joinable()) app.sys_audio_thread->join();
-    if (app.screen_send_thread && app.screen_send_thread->joinable()) app.screen_send_thread->join();
-    if (app.screen_decode_thread && app.screen_decode_thread->joinable()) app.screen_decode_thread->join();
-
-    app.tcp_thread.reset();
-    app.screen_thread.reset();
-    app.sys_audio_thread.reset();
-    app.screen_send_thread.reset();
-    app.screen_decode_thread.reset();
-    app.tcp.reset();
-    app.udp.reset();
-
-    // Clean up jitter buffers and voice decoders
-    {
-        std::lock_guard<std::mutex> lk(app.jitter_mutex);
-        app.jitter_buffers.clear();
-        app.voice_decoders.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lk(app.voice_activity_mutex);
-        app.voice_last_seen.clear();
-    }
-
-    // Clean up system audio state
-    {
-        std::lock_guard<std::mutex> lk(app.sys_audio_mutex);
-        app.sys_audio_frames.clear();
-        app.sys_audio_decoder.reset();
-    }
-
-    // Clean up screen send queue
-    {
-        std::lock_guard<std::mutex> lk(app.screen_send_mutex);
-        app.screen_send_queue.clear();
-    }
-
-    // Clean up screen viewer state (SRV is owned by decoder thread, not us)
-    {
-        std::lock_guard<std::mutex> lk(app.screen_srv_mutex);
-        app.screen_srv = nullptr;
-        app.screen_srv_w = 0;
-        app.screen_srv_h = 0;
-    }
-    {
-        std::lock_guard<std::mutex> lk(app.screen_frame_mutex);
-        app.screen_frame_buf.clear();
-        app.screen_frame_flags = 0;
-        app.screen_frame_new = false;
-    }
-    app.force_keyframe = false;
-
-    {
-        std::lock_guard<std::mutex> lk(app.users_mutex);
-        app.users.clear();
-    }
-
-    app.add_system_msg("Disconnected.");
-}
-
-// ════════════════════════════════════════════════════════════════
-//  PTT key names
-// ════════════════════════════════════════════════════════════════
-struct PttKeyOption {
-    int         vk;
-    const char* name;
-};
-
-static const PttKeyOption g_ptt_keys[] = {
-    { 0x56, "V" },
-    { 0x42, "B" },
-    { 0x47, "G" },
-    { 0x54, "T" },
-    { VK_CAPITAL, "Caps Lock" },
-    { VK_XBUTTON1, "Mouse 4" },
-    { VK_XBUTTON2, "Mouse 5" },
-};
-static const int g_ptt_key_count = sizeof(g_ptt_keys) / sizeof(g_ptt_keys[0]);
-
-// ════════════════════════════════════════════════════════════════
-//  Theme
-// ════════════════════════════════════════════════════════════════
-static void ApplyLilyPadTheme() {
-    ImGuiStyle& style = ImGui::GetStyle();
-    ImVec4* colors    = style.Colors;
-
-    style.WindowRounding    = 6.0f;
-    style.FrameRounding     = 4.0f;
-    style.GrabRounding      = 3.0f;
-    style.PopupRounding     = 4.0f;
-    style.ScrollbarRounding = 4.0f;
-    style.TabRounding       = 4.0f;
-    style.WindowPadding     = ImVec2(12, 12);
-    style.FramePadding      = ImVec2(8, 5);
-    style.ItemSpacing       = ImVec2(8, 6);
-
-    ImVec4 bg_dark   = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    ImVec4 bg_mid    = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
-    ImVec4 bg_light  = ImVec4(0.18f, 0.18f, 0.21f, 1.00f);
-    ImVec4 accent    = ImVec4(0.33f, 0.72f, 0.48f, 1.00f);
-    ImVec4 accent_hi = ImVec4(0.40f, 0.82f, 0.55f, 1.00f);
-    ImVec4 accent_lo = ImVec4(0.25f, 0.55f, 0.38f, 1.00f);
-    ImVec4 text      = ImVec4(0.90f, 0.92f, 0.90f, 1.00f);
-    ImVec4 text_dim  = ImVec4(0.55f, 0.57f, 0.55f, 1.00f);
-    ImVec4 border    = ImVec4(0.22f, 0.22f, 0.25f, 1.00f);
-
-    colors[ImGuiCol_WindowBg]             = bg_dark;
-    colors[ImGuiCol_ChildBg]              = bg_mid;
-    colors[ImGuiCol_PopupBg]              = ImVec4(0.10f, 0.10f, 0.12f, 0.96f);
-    colors[ImGuiCol_Border]               = border;
-    colors[ImGuiCol_FrameBg]              = bg_light;
-    colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.24f, 0.24f, 0.28f, 1.00f);
-    colors[ImGuiCol_FrameBgActive]        = ImVec4(0.28f, 0.28f, 0.33f, 1.00f);
-    colors[ImGuiCol_TitleBg]              = bg_dark;
-    colors[ImGuiCol_TitleBgActive]        = bg_mid;
-    colors[ImGuiCol_TitleBgCollapsed]     = bg_dark;
-    colors[ImGuiCol_MenuBarBg]            = bg_mid;
-    colors[ImGuiCol_ScrollbarBg]          = bg_dark;
-    colors[ImGuiCol_ScrollbarGrab]        = bg_light;
-    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.28f, 0.28f, 0.32f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive]  = accent_lo;
-    colors[ImGuiCol_CheckMark]            = accent;
-    colors[ImGuiCol_SliderGrab]           = accent;
-    colors[ImGuiCol_SliderGrabActive]     = accent_hi;
-    colors[ImGuiCol_Button]               = bg_light;
-    colors[ImGuiCol_ButtonHovered]        = ImVec4(0.25f, 0.25f, 0.30f, 1.00f);
-    colors[ImGuiCol_ButtonActive]         = accent_lo;
-    colors[ImGuiCol_Header]               = bg_light;
-    colors[ImGuiCol_HeaderHovered]        = ImVec4(0.24f, 0.24f, 0.28f, 1.00f);
-    colors[ImGuiCol_HeaderActive]         = accent_lo;
-    colors[ImGuiCol_Separator]            = border;
-    colors[ImGuiCol_SeparatorHovered]     = accent;
-    colors[ImGuiCol_SeparatorActive]      = accent_hi;
-    colors[ImGuiCol_ResizeGrip]           = ImVec4(0.20f, 0.20f, 0.23f, 0.50f);
-    colors[ImGuiCol_ResizeGripHovered]    = accent;
-    colors[ImGuiCol_ResizeGripActive]     = accent_hi;
-    colors[ImGuiCol_Tab]                  = bg_light;
-    colors[ImGuiCol_TabHovered]           = accent;
-    colors[ImGuiCol_TabSelected]          = accent_lo;
-    colors[ImGuiCol_Text]                 = text;
-    colors[ImGuiCol_TextDisabled]         = text_dim;
-}
-
-// ════════════════════════════════════════════════════════════════
 //  WinMain
 // ════════════════════════════════════════════════════════════════
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int) {
+    (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
     lilypad::WinsockInit winsock;
     lilypad::PortAudioInit pa;
@@ -1570,18 +144,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.hCursor        = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassEx(&wc);
 
-    HWND hwnd = CreateWindow(wc.lpszClassName, _T("LilyPad Voice Chat"),
+    g_hwnd = CreateWindow(wc.lpszClassName, _T("LilyPad Voice Chat"),
         WS_OVERLAPPEDWINDOW, 100, 100, 900, 620,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    if (!CreateD3DDevice(hwnd)) {
+    // Extend frame into client area to preserve DWM drop shadow
+    MARGINS margins = {0, 0, 0, 1};
+    DwmExtendFrameIntoClientArea(g_hwnd, &margins);
+
+    // Force WM_NCCALCSIZE immediately so the native title bar is never visible
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    if (!CreateD3DDevice(g_hwnd)) {
         CleanupD3D();
         UnregisterClass(wc.lpszClassName, wc.hInstance);
         return 1;
     }
 
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
+    ShowWindow(g_hwnd, SW_SHOWDEFAULT);
+    UpdateWindow(g_hwnd);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1590,7 +172,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     ApplyLilyPadTheme();
 
-    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_d3d_device, g_d3d_context);
 
     // ── State ──
@@ -1621,7 +203,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // PTT UI state
     bool ptt_enabled = false;
     int  ptt_key_sel = 0; // index into g_ptt_keys
-    bool noise_suppression = false;
+    bool noise_suppression = true;
 
     // Screen sharing UI state
     int bitrate_mbps = 0;  // 0 = auto
@@ -1691,30 +273,282 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-        // Title bar
+        // ── Custom title bar with traffic light buttons ──
         {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.33f, 0.72f, 0.48f, 1.00f));
-            ImGui::Text("LilyPad");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::TextDisabled("Voice Chat");
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            ImVec2 wp = ImGui::GetWindowPos();
+            float win_w = ImGui::GetWindowWidth();
 
-            // Status indicator on the right (only when in voice)
-            if (app.connected && app.in_voice) {
-                ImGui::SameLine(ImGui::GetWindowWidth() - 140);
-                if (app.muted) {
-                    ImGui::TextColored(ImVec4(0.72f, 0.28f, 0.28f, 1.0f), "[MUTED]");
-                } else if (app.ptt_enabled) {
-                    if (app.ptt_active) {
-                        ImGui::TextColored(ImVec4(0.40f, 0.82f, 0.55f, 1.0f), "[TRANSMITTING]");
-                    } else {
-                        ImGui::TextDisabled("[PTT: %s]", g_ptt_keys[ptt_key_sel].name);
+            // Background
+            dl->AddRectFilled(wp, ImVec2(wp.x + win_w, wp.y + CUSTOM_TITLEBAR_HEIGHT),
+                              IM_COL32(20, 20, 24, 255));
+
+            // Separator line at bottom of title bar
+            dl->AddLine(ImVec2(wp.x, wp.y + CUSTOM_TITLEBAR_HEIGHT),
+                        ImVec2(wp.x + win_w, wp.y + CUSTOM_TITLEBAR_HEIGHT),
+                        IM_COL32(60, 60, 68, 255));
+
+            // Traffic light buttons (right side: minimize, maximize, close)
+            const float btn_radius  = 5.5f;
+            const float btn_spacing = 22.0f;
+            const float btn_margin_right = 18.0f;
+            const float btn_center_y = CUSTOM_TITLEBAR_HEIGHT * 0.5f;
+
+            // Rightmost button (close) is at win_w - margin - radius, then go left
+            ImVec2 btn_centers[3] = {
+                ImVec2(wp.x + win_w - btn_margin_right,                       wp.y + btn_center_y), // close (rightmost)
+                ImVec2(wp.x + win_w - btn_margin_right - btn_spacing,         wp.y + btn_center_y), // maximize
+                ImVec2(wp.x + win_w - btn_margin_right - btn_spacing * 2.0f,  wp.y + btn_center_y), // minimize
+            };
+
+            // Button colors: close (red), maximize (green), minimize (yellow)
+            ImU32 btn_colors_active[3] = {
+                IM_COL32(0xFF, 0x5F, 0x57, 255),  // close - red
+                IM_COL32(0x28, 0xC8, 0x40, 255),  // maximize - green
+                IM_COL32(0xFE, 0xBC, 0x2E, 255),  // minimize - yellow
+            };
+            ImU32 btn_color_inactive = IM_COL32(75, 75, 80, 255); // gray when unfocused
+
+            bool window_focused = (GetForegroundWindow() == g_hwnd);
+
+            // Gear button position (left of minimize)
+            ImVec2 gear_center(wp.x + win_w - btn_margin_right - btn_spacing * 3.0f, wp.y + btn_center_y);
+            g_gear_btn_pos = gear_center;
+
+            // Check if mouse is hovering the button group area (traffic lights + gear)
+            ImVec2 group_min(wp.x + win_w - btn_margin_right - btn_spacing * 3.0f - btn_radius - 4.0f,
+                             wp.y + btn_center_y - btn_radius - 4.0f);
+            ImVec2 group_max(wp.x + win_w - btn_margin_right + btn_radius + 4.0f,
+                             wp.y + btn_center_y + btn_radius + 4.0f);
+            ImVec2 mouse = ImGui::GetMousePos();
+            bool group_hovered = (mouse.x >= group_min.x && mouse.x <= group_max.x &&
+                                  mouse.y >= group_min.y && mouse.y <= group_max.y);
+
+            // Track if cursor is over traffic light buttons (for WM_NCHITTEST)
+            g_cursor_on_titlebar = group_hovered;
+
+            // Draw buttons
+            for (int i = 0; i < 3; i++) {
+                ImU32 color = window_focused ? btn_colors_active[i] : btn_color_inactive;
+                dl->AddCircleFilled(btn_centers[i], btn_radius, color);
+            }
+
+            // Draw icons on hover (only when group is hovered)
+            if (group_hovered) {
+                ImU32 icon_col = IM_COL32(60, 20, 20, 200);
+                float s = 3.0f; // icon half-size
+
+                // Close icon (X) -- index 0, rightmost
+                dl->AddLine(ImVec2(btn_centers[0].x - s, btn_centers[0].y - s),
+                            ImVec2(btn_centers[0].x + s, btn_centers[0].y + s),
+                            icon_col, 1.5f);
+                dl->AddLine(ImVec2(btn_centers[0].x + s, btn_centers[0].y - s),
+                            ImVec2(btn_centers[0].x - s, btn_centers[0].y + s),
+                            icon_col, 1.5f);
+
+                // Maximize icon -- index 1, middle
+                if (IsZoomed(g_hwnd)) {
+                    // Restore icon: two small arrows pointing inward
+                    dl->AddLine(ImVec2(btn_centers[1].x - s, btn_centers[1].y + s),
+                                ImVec2(btn_centers[1].x,      btn_centers[1].y),
+                                icon_col, 1.5f);
+                    dl->AddLine(ImVec2(btn_centers[1].x + s, btn_centers[1].y - s),
+                                ImVec2(btn_centers[1].x,      btn_centers[1].y),
+                                icon_col, 1.5f);
+                } else {
+                    dl->AddLine(ImVec2(btn_centers[1].x - s, btn_centers[1].y + s),
+                                ImVec2(btn_centers[1].x + s, btn_centers[1].y - s),
+                                icon_col, 1.5f);
+                }
+
+                // Minimize icon (dash) -- index 2, leftmost
+                dl->AddLine(ImVec2(btn_centers[2].x - s, btn_centers[2].y),
+                            ImVec2(btn_centers[2].x + s, btn_centers[2].y),
+                            icon_col, 1.5f);
+
+                // Handle clicks
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    for (int i = 0; i < 3; i++) {
+                        float dx = mouse.x - btn_centers[i].x;
+                        float dy = mouse.y - btn_centers[i].y;
+                        if (dx * dx + dy * dy <= btn_radius * btn_radius) {
+                            if (i == 0) PostMessage(g_hwnd, WM_CLOSE, 0, 0);
+                            if (i == 1) ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+                            if (i == 2) ShowWindow(g_hwnd, SW_MINIMIZE);
+                            break;
+                        }
                     }
                 }
             }
+
+            // Gear (options) button
+            {
+                float gr = btn_radius; // same radius as traffic lights
+                bool gear_hovered = false;
+                {
+                    float dx = mouse.x - gear_center.x;
+                    float dy = mouse.y - gear_center.y;
+                    gear_hovered = (dx * dx + dy * dy <= (gr + 4.0f) * (gr + 4.0f));
+                }
+
+                ImU32 gear_color = g_options_menu_open
+                    ? IM_COL32(180, 180, 190, 255)
+                    : (gear_hovered ? IM_COL32(140, 140, 150, 255) : IM_COL32(90, 90, 100, 255));
+
+                // Draw gear: outer circle + inner circle + 6 teeth (short radial lines)
+                dl->AddCircle(gear_center, gr, gear_color, 0, 1.5f);
+                dl->AddCircleFilled(gear_center, gr * 0.35f, gear_color);
+                const int teeth = 6;
+                for (int t = 0; t < teeth; t++) {
+                    float angle = (float)t / (float)teeth * 6.2831853f;
+                    float cos_a = cosf(angle);
+                    float sin_a = sinf(angle);
+                    dl->AddLine(
+                        ImVec2(gear_center.x + cos_a * (gr - 1.0f), gear_center.y + sin_a * (gr - 1.0f)),
+                        ImVec2(gear_center.x + cos_a * (gr + 2.5f), gear_center.y + sin_a * (gr + 2.5f)),
+                        gear_color, 2.0f);
+                }
+
+                // Click to toggle options menu
+                if (gear_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    g_options_menu_open = !g_options_menu_open;
+                }
+            }
+
+            // Title text (left side)
+            float text_x = 14.0f;
+            float text_y = btn_center_y - ImGui::GetFontSize() * 0.5f;
+            dl->AddText(ImVec2(wp.x + text_x, wp.y + text_y),
+                        IM_COL32(84, 184, 122, 255), "LilyPad");
+            float lilypad_w = ImGui::CalcTextSize("LilyPad").x;
+            dl->AddText(ImVec2(wp.x + text_x + lilypad_w + 6.0f, wp.y + text_y),
+                        IM_COL32(128, 128, 138, 255), "Voice Chat");
+
+            // Status indicator on the right
+            if (app.connected && app.in_voice) {
+                const char* status_text = nullptr;
+                ImU32 status_color = 0;
+                if (app.muted) {
+                    status_text = "[MUTED]";
+                    status_color = IM_COL32(184, 71, 71, 255);
+                } else if (app.ptt_enabled) {
+                    if (app.ptt_active) {
+                        status_text = "[TRANSMITTING]";
+                        status_color = IM_COL32(102, 209, 140, 255);
+                    } else {
+                        static char ptt_buf[64];
+                        snprintf(ptt_buf, sizeof(ptt_buf), "[PTT: %s]", g_ptt_keys[ptt_key_sel].name);
+                        status_text = ptt_buf;
+                        status_color = IM_COL32(128, 128, 138, 255);
+                    }
+                }
+                if (status_text) {
+                    float tw = ImGui::CalcTextSize(status_text).x;
+                    float buttons_left = win_w - btn_margin_right - btn_spacing * 2.0f - btn_radius - 14.0f;
+                    dl->AddText(ImVec2(wp.x + buttons_left - tw, wp.y + text_y),
+                                status_color, status_text);
+                }
+            }
+
+            // Advance cursor past the title bar area
+            ImGui::SetCursorPosY(CUSTOM_TITLEBAR_HEIGHT + 4.0f);
         }
-        ImGui::Separator();
-        ImGui::Spacing();
+
+        // ── Options dropdown menu (anchored below gear button) ──
+        if (g_options_menu_open) {
+            ImGui::SetNextWindowPos(ImVec2(g_gear_btn_pos.x - 200.0f, g_gear_btn_pos.y + 18.0f));
+            ImGui::SetNextWindowSize(ImVec2(240, 0));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.14f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.24f, 0.24f, 0.27f, 1.0f));
+            ImGui::Begin("##OptionsMenu", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoSavedSettings);
+
+            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Audio Devices");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::Text("Input");
+            ImGui::SetNextItemWidth(-1);
+            {
+                const char* in_preview = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
+                    ? input_devices[selected_input].name.c_str() : "Default";
+                if (ImGui::BeginCombo("##opt_in_dev", in_preview)) {
+                    for (int i = 0; i < static_cast<int>(input_devices.size()); ++i) {
+                        bool sel = (selected_input == i);
+                        if (ImGui::Selectable(input_devices[i].name.c_str(), sel))
+                            selected_input = i;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Text("Output");
+            ImGui::SetNextItemWidth(-1);
+            {
+                const char* out_preview = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
+                    ? output_devices[selected_output].name.c_str() : "Default";
+                if (ImGui::BeginCombo("##opt_out_dev", out_preview)) {
+                    for (int i = 0; i < static_cast<int>(output_devices.size()); ++i) {
+                        bool sel = (selected_output == i);
+                        if (ImGui::Selectable(output_devices[i].name.c_str(), sel))
+                            selected_output = i;
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Mode");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ImGui::Checkbox("Push-to-Talk##opt", &ptt_enabled)) {
+                if (app.in_voice.load()) app.ptt_enabled = ptt_enabled;
+            }
+            if (ptt_enabled) {
+                ImGui::Text("PTT Key");
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::BeginCombo("##opt_ptt_key", g_ptt_keys[ptt_key_sel].name)) {
+                    for (int i = 0; i < g_ptt_key_count; ++i) {
+                        bool sel = (ptt_key_sel == i);
+                        if (ImGui::Selectable(g_ptt_keys[i].name, sel)) {
+                            ptt_key_sel = i;
+                            if (app.in_voice.load()) app.ptt_key = g_ptt_keys[i].vk;
+                        }
+                        if (sel) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Noise Suppression##opt", &noise_suppression)) {
+                if (app.in_voice.load()) app.noise_suppression = noise_suppression;
+            }
+
+            ImGui::Spacing();
+
+            // Close when clicking outside the popup
+            if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows) &&
+                ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // Don't close if clicking the gear button itself (toggle handles that)
+                float dx = ImGui::GetMousePos().x - g_gear_btn_pos.x;
+                float dy = ImGui::GetMousePos().y - g_gear_btn_pos.y;
+                if (dx * dx + dy * dy > 100.0f) {
+                    g_options_menu_open = false;
+                }
+            }
+
+            ImGui::End();
+            ImGui::PopStyleColor(2);
+        }
 
         bool is_connected = app.connected.load();
 
@@ -1731,7 +565,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         if (!is_connected) {
             ImGui::Text("Server IP");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##ip", ip_buf, sizeof(ip_buf));
+            ImGui::InputText("##ip", ip_buf, sizeof(ip_buf) - 1);
+
+            // Validate IP address before connecting
+            if (!is_valid_ip(ip_buf)) {
+                std::cerr << "Invalid IP address: " << ip_buf << "\n";
+                strncpy(ip_buf, "127.0.0.1", sizeof(ip_buf) - 1); // Reset to default
+                ip_buf[sizeof(ip_buf) - 1] = '\0';
+            }
+
+            // Validate username before connecting
+            if (!is_valid_username(username_buf)) {
+                std::cerr << "Invalid username: " << username_buf << "\n";
+                strncpy(username_buf, "Guest", sizeof(username_buf) - 1); // Reset to default
+                username_buf[sizeof(username_buf) - 1] = '\0';
+            }
+
+            // Display error messages for invalid input
+            if (!is_valid_ip(ip_buf)) {
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Invalid IP address.");
+            }
+            if (!is_valid_username(username_buf)) {
+                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Invalid username. Use 3-32 alphanumeric characters.");
+            }
 
             // Favorites
             ImGui::Spacing();
@@ -1739,7 +595,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Separator();
             ImGui::Spacing();
 
-            // Favorite server buttons — click to connect, X to remove
+            // Favorite server buttons -- click to connect, X to remove
             int fav_to_remove = -1;
             for (int i = 0; i < static_cast<int>(favorites.size()); ++i) {
                 ImGui::PushID(i);
@@ -1799,16 +655,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##fav_name", fav_name_buf, sizeof(fav_name_buf));
             if (ImGui::SmallButton("Save to Favorites")) {
-                std::string ip_str(ip_buf);
-                if (!ip_str.empty()) {
-                    std::string name_str(fav_name_buf);
-                    if (name_str.empty()) name_str = ip_str;
-                    std::string user_str(username_buf);
-                    favorites.push_back({name_str, ip_str, user_str});
-                    save_favorites(favorites);
-                    fav_name_buf[0] = '\0';
-                    selected_fav = static_cast<int>(favorites.size()) - 1;
+                // Validate and sanitize favorite server details
+                if (!is_valid_ip(ip_buf)) {
+                    std::cerr << "Invalid IP address for favorite: " << ip_buf << "\n";
+                    return;
                 }
+                std::string sanitized_name = sanitize_chat_input(fav_name_buf);
+                if (sanitized_name.empty()) {
+                    sanitized_name = ip_buf; // Default to IP if name is invalid
+                }
+                favorites.push_back({sanitized_name, ip_buf, username_buf});
+                save_favorites(favorites);
             }
 
             ImGui::Spacing();
@@ -1816,70 +673,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
             ImGui::Text("Username");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##user", username_buf, sizeof(username_buf));
-
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            // Audio devices
-            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Audio Devices");
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            ImGui::Text("Input");
-            ImGui::SetNextItemWidth(-1);
-            const char* in_preview = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
-                ? input_devices[selected_input].name.c_str() : "Default";
-            if (ImGui::BeginCombo("##in_dev", in_preview)) {
-                for (int i = 0; i < static_cast<int>(input_devices.size()); ++i) {
-                    bool sel = (selected_input == i);
-                    if (ImGui::Selectable(input_devices[i].name.c_str(), sel))
-                        selected_input = i;
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::Spacing();
-            ImGui::Text("Output");
-            ImGui::SetNextItemWidth(-1);
-            const char* out_preview = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
-                ? output_devices[selected_output].name.c_str() : "Default";
-            if (ImGui::BeginCombo("##out_dev", out_preview)) {
-                for (int i = 0; i < static_cast<int>(output_devices.size()); ++i) {
-                    bool sel = (selected_output == i);
-                    if (ImGui::Selectable(output_devices[i].name.c_str(), sel))
-                        selected_output = i;
-                    if (sel) ImGui::SetItemDefaultFocus();
-                }
-                ImGui::EndCombo();
-            }
-
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            // PTT settings (before connect)
-            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Mode");
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            ImGui::Checkbox("Push-to-Talk", &ptt_enabled);
-            if (ptt_enabled) {
-                ImGui::Text("PTT Key");
-                ImGui::SetNextItemWidth(-1);
-                if (ImGui::BeginCombo("##ptt_key", g_ptt_keys[ptt_key_sel].name)) {
-                    for (int i = 0; i < g_ptt_key_count; ++i) {
-                        bool sel = (ptt_key_sel == i);
-                        if (ImGui::Selectable(g_ptt_keys[i].name, sel))
-                            ptt_key_sel = i;
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-            }
-
-            ImGui::Spacing();
-            ImGui::Checkbox("Noise Suppression", &noise_suppression);
+            ImGui::InputText("##user", username_buf, sizeof(username_buf) - 1);
 
             ImGui::Spacing();
             ImGui::Spacing();
@@ -1939,44 +733,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
             bool is_in_voice = app.in_voice.load();
 
-            // Audio device selection (visible when NOT in voice, for choosing before joining)
-            if (!is_in_voice) {
-                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Audio Devices");
-                ImGui::Separator();
-                ImGui::Spacing();
-
-                ImGui::Text("Input");
-                ImGui::SetNextItemWidth(-1);
-                const char* in_preview = (selected_input >= 0 && selected_input < static_cast<int>(input_devices.size()))
-                    ? input_devices[selected_input].name.c_str() : "Default";
-                if (ImGui::BeginCombo("##in_dev_conn", in_preview)) {
-                    for (int i = 0; i < static_cast<int>(input_devices.size()); ++i) {
-                        bool sel = (selected_input == i);
-                        if (ImGui::Selectable(input_devices[i].name.c_str(), sel))
-                            selected_input = i;
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-
-                ImGui::Spacing();
-                ImGui::Text("Output");
-                ImGui::SetNextItemWidth(-1);
-                const char* out_preview = (selected_output >= 0 && selected_output < static_cast<int>(output_devices.size()))
-                    ? output_devices[selected_output].name.c_str() : "Default";
-                if (ImGui::BeginCombo("##out_dev_conn", out_preview)) {
-                    for (int i = 0; i < static_cast<int>(output_devices.size()); ++i) {
-                        bool sel = (selected_output == i);
-                        if (ImGui::Selectable(output_devices[i].name.c_str(), sel))
-                            selected_output = i;
-                        if (sel) ImGui::SetItemDefaultFocus();
-                    }
-                    ImGui::EndCombo();
-                }
-
-                ImGui::Spacing();
-            }
-
             // Join / Leave Voice button
             if (is_in_voice) {
                 // Leave Voice (red)
@@ -2026,36 +782,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     ImGui::PopStyleColor(3);
                 }
 
-                ImGui::Spacing();
-
-                // Voice mode toggle (live)
-                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Voice Mode");
-                ImGui::Separator();
-                ImGui::Spacing();
-
-                if (ImGui::Checkbox("Push-to-Talk##live", &ptt_enabled)) {
-                    app.ptt_enabled = ptt_enabled;
-                }
-                if (ptt_enabled) {
-                    ImGui::SameLine();
-                    ImGui::SetNextItemWidth(90);
-                    if (ImGui::BeginCombo("##ptt_key_live", g_ptt_keys[ptt_key_sel].name)) {
-                        for (int i = 0; i < g_ptt_key_count; ++i) {
-                            bool sel = (ptt_key_sel == i);
-                            if (ImGui::Selectable(g_ptt_keys[i].name, sel)) {
-                                ptt_key_sel = i;
-                                app.ptt_key = g_ptt_keys[i].vk;
-                            }
-                            if (sel) ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                    }
-                }
-
-                ImGui::Spacing();
-                if (ImGui::Checkbox("Noise Suppression##live", &noise_suppression)) {
-                    app.noise_suppression = noise_suppression;
-                }
             }
 
             ImGui::Spacing();
@@ -2127,7 +853,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Spacing();
             ImGui::Spacing();
 
-            // User list — grouped by voice channel / text chat
+            // User list -- grouped by voice channel / text chat
             {
                 std::lock_guard<std::mutex> lk(app.users_mutex);
 
@@ -2308,7 +1034,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ImGui::Separator();
         bool send_chat = false;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70);
-        if (ImGui::InputText("##chat_input", chat_input, sizeof(chat_input),
+        if (ImGui::InputText("##chat_input", chat_input, sizeof(chat_input) - 1,
                 ImGuiInputTextFlags_EnterReturnsTrue)) {
             send_chat = true;
         }
@@ -2317,13 +1043,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             send_chat = true;
         }
 
+        // Sanitize chat input before sending
         if (send_chat && chat_input[0] != '\0' && is_connected) {
-            auto msg = lilypad::make_text_chat_msg(chat_input);
-            app.send_tcp(msg);
+            std::string sanitized_input = sanitize_chat_input(chat_input);
+            if (!sanitized_input.empty()) {
+                auto msg = lilypad::make_text_chat_msg(sanitized_input);
+                app.send_tcp(msg);
+            } else {
+                std::cerr << "Chat input contains invalid characters.\n";
+            }
             chat_input[0] = '\0';
             scroll_chat_to_bottom = true;
-            // Re-focus the input field
-            ImGui::SetKeyboardFocusHere(-1);
+            ImGui::SetKeyboardFocusHere(-1); // Re-focus the input field
         }
 
         ImGui::EndChild();
@@ -2380,7 +1111,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             }
         }
 
-        // ── Render ──
+        // ── Render ─
         ImGui::Render();
         g_d3d_context->OMSetRenderTargets(1, &g_rtv, nullptr);
         float clear[4] = { clear_color.x, clear_color.y, clear_color.z, clear_color.w };
@@ -2398,7 +1129,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ImGui::DestroyContext();
 
     CleanupD3D();
-    DestroyWindow(hwnd);
+    DestroyWindow(g_hwnd);
     UnregisterClass(wc.lpszClassName, wc.hInstance);
 
     MFShutdown();

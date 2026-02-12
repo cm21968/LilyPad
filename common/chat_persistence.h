@@ -7,11 +7,11 @@
 namespace lilypad {
 
 struct ChatLine {
-    uint64_t    seq;
+    uint64_t    seq       = 0;
     std::string sender;
-    int64_t     timestamp;
+    int64_t     timestamp = 0;
     std::string text;
-    bool        valid = false;
+    bool        valid     = false;
 };
 
 // Escape special characters for JSON string values

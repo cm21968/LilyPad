@@ -198,8 +198,8 @@ constexpr size_t VOICE_HEADER_SIZE = 8;
 constexpr size_t MAX_VOICE_PACKET  = 1400; // safe for MTU
 
 struct VoicePacket {
-    uint32_t             client_id;
-    uint32_t             sequence;
+    uint32_t             client_id = 0;
+    uint32_t             sequence  = 0;
     std::vector<uint8_t> opus_data;
 
     std::vector<uint8_t> to_bytes() const {

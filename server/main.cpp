@@ -28,10 +28,10 @@ void signal_handler(int) {
 }
 
 struct ClientInfo {
-    uint32_t           id;
+    uint32_t           id = 0;
     std::string        username;
     lilypad::Socket    tcp_socket;
-    sockaddr_in        udp_addr;    // filled in when first UDP packet arrives
+    sockaddr_in        udp_addr{};   // filled in when first UDP packet arrives
     bool               udp_known = false;
 
     // Voice channel
@@ -49,9 +49,9 @@ static uint32_t                                     g_next_id = 1;
 
 // ── Chat history (persistent across restarts via chat_history.jsonl) ──
 struct ChatEntry {
-    uint64_t    seq;
+    uint64_t    seq       = 0;
     std::string sender_name;
-    int64_t     timestamp;
+    int64_t     timestamp = 0;
     std::string text;
 };
 static std::mutex                g_chat_mutex;
@@ -188,6 +188,11 @@ static void remove_client(uint32_t client_id) {
     std::cout << "[Server] " << name << " (id=" << client_id << ") left.\n";
 }
 
+// ── Per-client read threads (forward declarations for tcp_accept_loop) ──
+static std::mutex               g_client_threads_mutex;
+static std::vector<std::thread> g_client_threads;
+static void client_read_loop(uint32_t id, SOCKET s);
+
 // ── Thread 1: Accept new TCP connections ──
 static void tcp_accept_loop(SOCKET listen_sock) {
     while (g_running) {
@@ -218,6 +223,11 @@ static void tcp_accept_loop(SOCKET listen_sock) {
         int sndbuf = 1024 * 1024; // 1MB
         setsockopt(new_sock, SOL_SOCKET, SO_SNDBUF,
                    reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+
+        // Large receive buffer so TCP window stays open for big H.264 frames
+        int rcvbuf = 1024 * 1024; // 1MB
+        setsockopt(new_sock, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
         lilypad::Socket client_tcp(new_sock);
 
@@ -296,12 +306,21 @@ static void tcp_accept_loop(SOCKET listen_sock) {
         }
 
         std::cout << "[Server] " << username << " (id=" << client_id << ") joined.\n";
+
+        // Spawn a dedicated read thread for this client so one slow sender
+        // can't block frame reception from other clients
+        {
+            std::lock_guard<std::mutex> lock(g_client_threads_mutex);
+            g_client_threads.emplace_back(client_read_loop, client_id, new_sock);
+        }
     }
 }
 
 // ── Non-blocking send helper for video frames ──
 // Attempts to send the full buffer without blocking. Returns true if fully sent,
 // false if the socket would block (frame should be skipped for this subscriber).
+// IMPORTANT: If any bytes were already written to the TCP stream, we MUST finish
+// sending the rest (blocking if needed) to avoid corrupting protocol framing.
 static bool try_send_nonblocking(SOCKET s, const uint8_t* data, size_t len) {
     // Set non-blocking
     u_long mode = 1;
@@ -309,24 +328,46 @@ static bool try_send_nonblocking(SOCKET s, const uint8_t* data, size_t len) {
 
     const char* ptr = reinterpret_cast<const char*>(data);
     int remaining = static_cast<int>(len);
-    bool ok = true;
+    int total_sent = 0;
 
     while (remaining > 0) {
         int sent = send(s, ptr, remaining, 0);
         if (sent > 0) {
             ptr += sent;
             remaining -= sent;
+            total_sent += sent;
         } else {
-            // WSAEWOULDBLOCK or error — skip this frame for this subscriber
-            ok = false;
-            break;
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK) {
+                if (total_sent == 0) {
+                    // Nothing sent yet — safe to skip this frame entirely
+                    mode = 0;
+                    ioctlsocket(s, FIONBIO, &mode);
+                    return false;
+                }
+                // Partial data already in the TCP stream — MUST finish to keep
+                // protocol framing intact. Switch to blocking and complete.
+                mode = 0;
+                ioctlsocket(s, FIONBIO, &mode);
+                while (remaining > 0) {
+                    sent = send(s, ptr, remaining, 0);
+                    if (sent <= 0) return false; // real error, connection dead
+                    ptr += sent;
+                    remaining -= sent;
+                }
+                return true;
+            }
+            // Real socket error — connection is likely dead
+            mode = 0;
+            ioctlsocket(s, FIONBIO, &mode);
+            return false;
         }
     }
 
     // Restore blocking mode
     mode = 0;
     ioctlsocket(s, FIONBIO, &mode);
-    return ok;
+    return true;
 }
 
 // ── Thread 2: Dedicated screen relay thread ──
@@ -402,214 +443,172 @@ static void screen_relay_loop() {
     }
 }
 
-// ── Thread 3: Poll all client TCP sockets for LEAVE / disconnect ──
-static void tcp_read_loop() {
+// ── Per-client read loop — each client gets its own thread so one slow
+//    remote sender can't block frame reception from other clients ──
+static void client_read_loop(uint32_t id, SOCKET s) {
     while (g_running) {
-        std::vector<uint32_t> to_check;
-        {
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            for (auto& [id, c] : g_clients) {
-                to_check.push_back(id);
-            }
-        }
-
-        if (to_check.empty()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
         fd_set read_set;
         FD_ZERO(&read_set);
-
-        {
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            for (uint32_t id : to_check) {
-                auto it = g_clients.find(id);
-                if (it != g_clients.end() && it->second.tcp_socket.valid()) {
-                    FD_SET(it->second.tcp_socket.get(), &read_set);
-                }
-            }
-        }
+        FD_SET(s, &read_set);
 
         timeval timeout{};
         timeout.tv_sec  = 0;
-        timeout.tv_usec = 200000;
+        timeout.tv_usec = 200000; // 200ms
 
         int ready = select(0, &read_set, nullptr, nullptr, &timeout);
         if (ready <= 0) continue;
 
-        for (uint32_t id : to_check) {
-            SOCKET s;
+        // Read header
+        uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
+        {
+            int total = 0;
+            while (total < static_cast<int>(lilypad::SIGNAL_HEADER_SIZE)) {
+                int r = recv(s, reinterpret_cast<char*>(hdr_buf + total),
+                             static_cast<int>(lilypad::SIGNAL_HEADER_SIZE) - total, 0);
+                if (r <= 0) { remove_client(id); return; }
+                total += r;
+            }
+        }
+
+        auto header = lilypad::deserialize_header(hdr_buf);
+
+        // Read payload (potentially large for screen frames)
+        std::vector<uint8_t> payload;
+        if (header.payload_len > 0) {
+            payload.resize(header.payload_len);
+            int total = 0;
+            int target = static_cast<int>(header.payload_len);
+            while (total < target) {
+                int r = recv(s, reinterpret_cast<char*>(payload.data() + total),
+                             target - total, 0);
+                if (r <= 0) { remove_client(id); return; }
+                total += r;
+            }
+        }
+
+        if (header.type == lilypad::MsgType::LEAVE) {
+            remove_client(id);
+            return;
+        } else if (header.type == lilypad::MsgType::TEXT_CHAT && !payload.empty()) {
+            std::string text(reinterpret_cast<const char*>(payload.data()));
+            std::string sender_name;
             {
                 std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(id);
-                if (it == g_clients.end() || !it->second.tcp_socket.valid()) continue;
-                s = it->second.tcp_socket.get();
+                auto cit = g_clients.find(id);
+                if (cit != g_clients.end())
+                    sender_name = cit->second.username;
+                else
+                    sender_name = "User #" + std::to_string(id);
             }
-
-            if (!FD_ISSET(s, &read_set)) continue;
-
-            // Read header using raw SOCKET (no lock needed — only this thread
-            // reads from client sockets, and remove_client is only called here)
-            uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
+            ChatEntry ce;
+            int64_t now_ts = static_cast<int64_t>(std::time(nullptr));
             {
-                int total = 0;
-                while (total < static_cast<int>(lilypad::SIGNAL_HEADER_SIZE)) {
-                    int r = recv(s, reinterpret_cast<char*>(hdr_buf + total),
-                                 static_cast<int>(lilypad::SIGNAL_HEADER_SIZE) - total, 0);
-                    if (r <= 0) { total = -1; break; }
-                    total += r;
-                }
-                if (total < 0) { remove_client(id); continue; }
+                std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
+                ce.seq         = g_next_seq++;
+                ce.sender_name = sender_name;
+                ce.timestamp   = now_ts;
+                ce.text        = text;
+                g_chat_history.push_back(ce);
             }
-
-            auto header = lilypad::deserialize_header(hdr_buf);
-
-            // Read payload using raw SOCKET — no lock held during potentially
-            // large reads (screen frames can be 100KB+)
-            std::vector<uint8_t> payload;
-            if (header.payload_len > 0) {
-                payload.resize(header.payload_len);
-                int total = 0;
-                int target = static_cast<int>(header.payload_len);
-                while (total < target) {
-                    int r = recv(s, reinterpret_cast<char*>(payload.data() + total),
-                                 target - total, 0);
-                    if (r <= 0) { total = -1; break; }
-                    total += r;
-                }
-                if (total < 0) { remove_client(id); continue; }
+            append_chat_to_file(ce);
+            auto broadcast = lilypad::make_text_chat_broadcast_v2(
+                ce.seq, id, ce.timestamp, ce.sender_name, ce.text);
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            broadcast_tcp(broadcast);
+        } else if (header.type == lilypad::MsgType::VOICE_JOIN) {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it != g_clients.end()) {
+                it->second.in_voice = true;
+                auto msg = lilypad::make_voice_joined_broadcast(id);
+                broadcast_tcp(msg);
             }
-
-            if (header.type == lilypad::MsgType::LEAVE) {
-                remove_client(id);
-            } else if (header.type == lilypad::MsgType::TEXT_CHAT && !payload.empty()) {
-                std::string text(reinterpret_cast<const char*>(payload.data()));
-                std::string sender_name;
-                {
+        } else if (header.type == lilypad::MsgType::VOICE_LEAVE) {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it != g_clients.end()) {
+                it->second.in_voice = false;
+                auto msg = lilypad::make_voice_left_broadcast(id);
+                broadcast_tcp(msg);
+            }
+        } else if (header.type == lilypad::MsgType::CHAT_SYNC && payload.size() >= 8) {
+            uint64_t last_seq = lilypad::read_u64(payload.data());
+            std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
+            for (auto& entry : g_chat_history) {
+                if (entry.seq > last_seq) {
+                    auto msg = lilypad::make_text_chat_broadcast_v2(
+                        entry.seq, 0, entry.timestamp, entry.sender_name, entry.text);
                     std::lock_guard<std::mutex> lock(g_clients_mutex);
                     auto cit = g_clients.find(id);
-                    if (cit != g_clients.end())
-                        sender_name = cit->second.username;
-                    else
-                        sender_name = "User #" + std::to_string(id);
-                }
-                ChatEntry ce;
-                int64_t now_ts = static_cast<int64_t>(std::time(nullptr));
-                {
-                    std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
-                    ce.seq         = g_next_seq++;
-                    ce.sender_name = sender_name;
-                    ce.timestamp   = now_ts;
-                    ce.text        = text;
-                    g_chat_history.push_back(ce);
-                }
-                append_chat_to_file(ce);
-                auto broadcast = lilypad::make_text_chat_broadcast_v2(
-                    ce.seq, id, ce.timestamp, ce.sender_name, ce.text);
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                broadcast_tcp(broadcast);
-            } else if (header.type == lilypad::MsgType::VOICE_JOIN) {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(id);
-                if (it != g_clients.end()) {
-                    it->second.in_voice = true;
-                    auto msg = lilypad::make_voice_joined_broadcast(id);
-                    broadcast_tcp(msg);
-                }
-            } else if (header.type == lilypad::MsgType::VOICE_LEAVE) {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(id);
-                if (it != g_clients.end()) {
-                    it->second.in_voice = false;
-                    auto msg = lilypad::make_voice_left_broadcast(id);
-                    broadcast_tcp(msg);
-                }
-            } else if (header.type == lilypad::MsgType::CHAT_SYNC && payload.size() >= 8) {
-                uint64_t last_seq = lilypad::read_u64(payload.data());
-                std::lock_guard<std::mutex> chat_lock(g_chat_mutex);
-                std::string sender_name_unused;
-                for (auto& entry : g_chat_history) {
-                    if (entry.seq > last_seq) {
-                        auto msg = lilypad::make_text_chat_broadcast_v2(
-                            entry.seq, 0, entry.timestamp, entry.sender_name, entry.text);
-                        // Send directly to this client only (no broadcast)
-                        std::lock_guard<std::mutex> lock(g_clients_mutex);
-                        auto cit = g_clients.find(id);
-                        if (cit != g_clients.end()) {
-                            cit->second.tcp_socket.send_all(msg);
-                        }
+                    if (cit != g_clients.end()) {
+                        cit->second.tcp_socket.send_all(msg);
                     }
                 }
-            } else if (header.type == lilypad::MsgType::SCREEN_START) {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(id);
-                if (it != g_clients.end()) {
-                    it->second.screen_sharing = true;
-                    auto msg = lilypad::make_screen_start_broadcast(id);
-                    broadcast_tcp(msg);
-                }
-            } else if (header.type == lilypad::MsgType::SCREEN_STOP) {
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(id);
-                if (it != g_clients.end()) {
-                    it->second.screen_sharing = false;
-                    it->second.screen_subscribers.clear();
-                    it->second.cached_keyframe.clear();
-                    auto msg = lilypad::make_screen_stop_broadcast(id);
-                    broadcast_tcp(msg);
-                }
-            } else if (header.type == lilypad::MsgType::SCREEN_SUBSCRIBE && payload.size() >= 4) {
-                uint32_t target_id = lilypad::read_u32(payload.data());
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(target_id);
-                if (it != g_clients.end() && it->second.screen_sharing) {
-                    it->second.screen_subscribers.insert(id);
-                    // Send cached keyframe to new subscriber so they can start decoding immediately
-                    auto sub_it = g_clients.find(id);
-                    if (sub_it != g_clients.end()) {
-                        if (!it->second.cached_keyframe.empty()) {
-                            sub_it->second.tcp_socket.send_all(it->second.cached_keyframe);
-                        } else {
-                            // No keyframe cached yet — ask sharer to produce one
-                            auto req = lilypad::make_screen_request_keyframe_msg();
-                            it->second.tcp_socket.send_all(req);
-                        }
-                    }
-                }
-            } else if (header.type == lilypad::MsgType::SCREEN_UNSUBSCRIBE && payload.size() >= 4) {
-                uint32_t target_id = lilypad::read_u32(payload.data());
-                std::lock_guard<std::mutex> lock(g_clients_mutex);
-                auto it = g_clients.find(target_id);
-                if (it != g_clients.end()) {
-                    it->second.screen_subscribers.erase(id);
-                }
-            } else if (header.type == lilypad::MsgType::SCREEN_FRAME && payload.size() >= 5) {
-                // Client sends: width(2) + height(2) + flags(1) + h264_data
-                uint16_t w = lilypad::read_u16(payload.data());
-                uint16_t h = lilypad::read_u16(payload.data() + 2);
-                uint8_t flags = payload[4];
-                const uint8_t* frame_data = payload.data() + 5;
-                size_t frame_len = payload.size() - 5;
-
-                bool is_keyframe = (flags & lilypad::SCREEN_FLAG_KEYFRAME) != 0;
-
-                auto relay = lilypad::make_screen_frame_relay(id, w, h, flags, frame_data, frame_len);
-
-                // Cache keyframes so new subscribers can start decoding immediately
-                if (is_keyframe) {
-                    std::lock_guard<std::mutex> lock(g_clients_mutex);
-                    auto it = g_clients.find(id);
-                    if (it != g_clients.end()) {
-                        it->second.cached_keyframe = relay;
-                    }
-                }
-
-                enqueue_relay(std::move(relay), id, false, is_keyframe);
-            } else if (header.type == lilypad::MsgType::SCREEN_AUDIO && !payload.empty()) {
-                auto relay = lilypad::make_screen_audio_relay(id, payload.data(), payload.size());
-                enqueue_relay(std::move(relay), id, true);
             }
+        } else if (header.type == lilypad::MsgType::SCREEN_START) {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it != g_clients.end()) {
+                it->second.screen_sharing = true;
+                auto msg = lilypad::make_screen_start_broadcast(id);
+                broadcast_tcp(msg);
+            }
+        } else if (header.type == lilypad::MsgType::SCREEN_STOP) {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it != g_clients.end()) {
+                it->second.screen_sharing = false;
+                it->second.screen_subscribers.clear();
+                it->second.cached_keyframe.clear();
+                auto msg = lilypad::make_screen_stop_broadcast(id);
+                broadcast_tcp(msg);
+            }
+        } else if (header.type == lilypad::MsgType::SCREEN_SUBSCRIBE && payload.size() >= 4) {
+            uint32_t target_id = lilypad::read_u32(payload.data());
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(target_id);
+            if (it != g_clients.end() && it->second.screen_sharing) {
+                it->second.screen_subscribers.insert(id);
+                auto sub_it = g_clients.find(id);
+                if (sub_it != g_clients.end()) {
+                    if (!it->second.cached_keyframe.empty()) {
+                        sub_it->second.tcp_socket.send_all(it->second.cached_keyframe);
+                    } else {
+                        auto req = lilypad::make_screen_request_keyframe_msg();
+                        it->second.tcp_socket.send_all(req);
+                    }
+                }
+            }
+        } else if (header.type == lilypad::MsgType::SCREEN_UNSUBSCRIBE && payload.size() >= 4) {
+            uint32_t target_id = lilypad::read_u32(payload.data());
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(target_id);
+            if (it != g_clients.end()) {
+                it->second.screen_subscribers.erase(id);
+            }
+        } else if (header.type == lilypad::MsgType::SCREEN_FRAME && payload.size() >= 5) {
+            uint16_t w = lilypad::read_u16(payload.data());
+            uint16_t h = lilypad::read_u16(payload.data() + 2);
+            uint8_t flags = payload[4];
+            const uint8_t* frame_data = payload.data() + 5;
+            size_t frame_len = payload.size() - 5;
+
+            bool is_keyframe = (flags & lilypad::SCREEN_FLAG_KEYFRAME) != 0;
+
+            auto relay = lilypad::make_screen_frame_relay(id, w, h, flags, frame_data, frame_len);
+
+            if (is_keyframe) {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) {
+                    it->second.cached_keyframe = relay;
+                }
+            }
+
+            enqueue_relay(std::move(relay), id, false, is_keyframe);
+        } else if (header.type == lilypad::MsgType::SCREEN_AUDIO && !payload.empty()) {
+            auto relay = lilypad::make_screen_audio_relay(id, payload.data(), payload.size());
+            enqueue_relay(std::move(relay), id, true);
         }
     }
 }
@@ -715,13 +714,20 @@ int main() {
 
         // ── Launch threads ──
         std::thread tcp_accept_thread(tcp_accept_loop, tcp_listen.get());
-        std::thread tcp_read_thread(tcp_read_loop);
         std::thread udp_relay_thread(udp_relay_loop, udp_sock.get());
         std::thread screen_relay_thread(screen_relay_loop);
 
         // Wait for Ctrl+C
         tcp_accept_thread.join();
-        tcp_read_thread.join();
+
+        // Join all per-client read threads (they exit when g_running is false)
+        {
+            std::lock_guard<std::mutex> lock(g_client_threads_mutex);
+            for (auto& t : g_client_threads) {
+                if (t.joinable()) t.join();
+            }
+        }
+
         udp_relay_thread.join();
         g_relay_cv.notify_all();
         screen_relay_thread.join();
