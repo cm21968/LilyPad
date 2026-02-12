@@ -25,32 +25,6 @@
 #include <shellapi.h>
 
 #include <thread>
-#include <regex>
-#include <iostream>
-
-// Validate IP address format (IPv4)
-bool is_valid_ip(const std::string& ip) {
-    const std::regex ip_regex(
-        R"(^((25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[0-1]?[0-9][0-9]?)$)");
-    return std::regex_match(ip, ip_regex);
-}
-
-// Validate username (alphanumeric, 3-32 characters)
-bool is_valid_username(const std::string& username) {
-    const std::regex username_regex(R"(^[a-zA-Z0-9_]{3,32}$)");
-    return std::regex_match(username, username_regex);
-}
-
-// Sanitize chat input (remove control characters)
-std::string sanitize_chat_input(const std::string& input) {
-    std::string sanitized;
-    for (char c : input) {
-        if (std::isprint(static_cast<unsigned char>(c)) || std::isspace(static_cast<unsigned char>(c))) {
-            sanitized += c;
-        }
-    }
-    return sanitized;
-}
 
 // ── Forward declarations ──
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -565,29 +539,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         if (!is_connected) {
             ImGui::Text("Server IP");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##ip", ip_buf, sizeof(ip_buf) - 1);
-
-            // Validate IP address before connecting
-            if (!is_valid_ip(ip_buf)) {
-                std::cerr << "Invalid IP address: " << ip_buf << "\n";
-                strncpy(ip_buf, "127.0.0.1", sizeof(ip_buf) - 1); // Reset to default
-                ip_buf[sizeof(ip_buf) - 1] = '\0';
-            }
-
-            // Validate username before connecting
-            if (!is_valid_username(username_buf)) {
-                std::cerr << "Invalid username: " << username_buf << "\n";
-                strncpy(username_buf, "Guest", sizeof(username_buf) - 1); // Reset to default
-                username_buf[sizeof(username_buf) - 1] = '\0';
-            }
-
-            // Display error messages for invalid input
-            if (!is_valid_ip(ip_buf)) {
-                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Invalid IP address.");
-            }
-            if (!is_valid_username(username_buf)) {
-                ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Invalid username. Use 3-32 alphanumeric characters.");
-            }
+            ImGui::InputText("##ip", ip_buf, sizeof(ip_buf));
 
             // Favorites
             ImGui::Spacing();
@@ -655,17 +607,16 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##fav_name", fav_name_buf, sizeof(fav_name_buf));
             if (ImGui::SmallButton("Save to Favorites")) {
-                // Validate and sanitize favorite server details
-                if (!is_valid_ip(ip_buf)) {
-                    std::cerr << "Invalid IP address for favorite: " << ip_buf << "\n";
-                    return;
+                std::string ip_str(ip_buf);
+                if (!ip_str.empty()) {
+                    std::string name_str(fav_name_buf);
+                    if (name_str.empty()) name_str = ip_str;
+                    std::string user_str(username_buf);
+                    favorites.push_back({name_str, ip_str, user_str});
+                    save_favorites(favorites);
+                    fav_name_buf[0] = '\0';
+                    selected_fav = static_cast<int>(favorites.size()) - 1;
                 }
-                std::string sanitized_name = sanitize_chat_input(fav_name_buf);
-                if (sanitized_name.empty()) {
-                    sanitized_name = ip_buf; // Default to IP if name is invalid
-                }
-                favorites.push_back({sanitized_name, ip_buf, username_buf});
-                save_favorites(favorites);
             }
 
             ImGui::Spacing();
@@ -673,7 +624,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
 
             ImGui::Text("Username");
             ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##user", username_buf, sizeof(username_buf) - 1);
+            ImGui::InputText("##user", username_buf, sizeof(username_buf));
 
             ImGui::Spacing();
             ImGui::Spacing();
@@ -1034,7 +985,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         ImGui::Separator();
         bool send_chat = false;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70);
-        if (ImGui::InputText("##chat_input", chat_input, sizeof(chat_input) - 1,
+        if (ImGui::InputText("##chat_input", chat_input, sizeof(chat_input),
                 ImGuiInputTextFlags_EnterReturnsTrue)) {
             send_chat = true;
         }
@@ -1043,18 +994,13 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             send_chat = true;
         }
 
-        // Sanitize chat input before sending
         if (send_chat && chat_input[0] != '\0' && is_connected) {
-            std::string sanitized_input = sanitize_chat_input(chat_input);
-            if (!sanitized_input.empty()) {
-                auto msg = lilypad::make_text_chat_msg(sanitized_input);
-                app.send_tcp(msg);
-            } else {
-                std::cerr << "Chat input contains invalid characters.\n";
-            }
+            auto msg = lilypad::make_text_chat_msg(chat_input);
+            app.send_tcp(msg);
             chat_input[0] = '\0';
             scroll_chat_to_bottom = true;
-            ImGui::SetKeyboardFocusHere(-1); // Re-focus the input field
+            // Re-focus the input field
+            ImGui::SetKeyboardFocusHere(-1);
         }
 
         ImGui::EndChild();
@@ -1111,7 +1057,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             }
         }
 
-        // ── Render ─
+        // ── Render ──
         ImGui::Render();
         g_d3d_context->OMSetRenderTargets(1, &g_rtv, nullptr);
         float clear[4] = { clear_color.x, clear_color.y, clear_color.z, clear_color.w };
