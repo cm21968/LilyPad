@@ -18,3 +18,13 @@ void save_favorites(const std::vector<ServerFavorite>& favs);
 // ── Settings ──
 AppSettings load_settings();
 void save_settings(const AppSettings& s);
+
+// ── Session tokens (remember me) ──
+struct SavedSession {
+    std::string username;
+    std::vector<uint8_t> token; // 32 bytes
+    bool valid = false;
+};
+SavedSession load_session(const std::string& server_ip);
+void save_session(const std::string& server_ip, const std::string& username, const uint8_t* token);
+void clear_session(const std::string& server_ip);

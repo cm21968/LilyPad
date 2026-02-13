@@ -3,6 +3,8 @@
 #include <shlobj.h>
 
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 
 std::string get_lilypad_dir() {
     PWSTR documents = nullptr;
@@ -136,4 +138,74 @@ std::string get_chat_cache_path(const std::string& server_ip) {
     std::string dir = get_chat_cache_dir(server_ip);
     if (dir.empty()) return "";
     return dir + "\\chat.jsonl";
+}
+
+// ── Session token persistence ──
+
+static std::string get_sessions_dir() {
+    std::string base = get_lilypad_dir();
+    if (base.empty()) return "";
+    std::string dir = base + "\\sessions";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir;
+}
+
+static std::string sanitize_ip(const std::string& ip) {
+    std::string safe = ip;
+    for (char& c : safe) {
+        if (c == ':' || c == '/' || c == '\\' || c == '.') c = '_';
+    }
+    return safe;
+}
+
+static std::string get_session_path(const std::string& server_ip) {
+    std::string dir = get_sessions_dir();
+    if (dir.empty()) return "";
+    return dir + "\\" + sanitize_ip(server_ip) + ".token";
+}
+
+SavedSession load_session(const std::string& server_ip) {
+    SavedSession session;
+    std::string path = get_session_path(server_ip);
+    if (path.empty()) return session;
+
+    std::ifstream file(path);
+    if (!file.is_open()) return session;
+
+    // Format: line 1 = username, line 2 = hex-encoded 32-byte token
+    std::string username, token_hex;
+    std::getline(file, username);
+    std::getline(file, token_hex);
+
+    if (username.empty() || token_hex.size() != 64) return session;
+
+    session.username = username;
+    session.token.resize(32);
+    for (int i = 0; i < 32; ++i) {
+        unsigned int byte;
+        std::istringstream iss(token_hex.substr(i * 2, 2));
+        iss >> std::hex >> byte;
+        session.token[i] = static_cast<uint8_t>(byte);
+    }
+    session.valid = true;
+    return session;
+}
+
+void save_session(const std::string& server_ip, const std::string& username, const uint8_t* token) {
+    std::string path = get_session_path(server_ip);
+    if (path.empty()) return;
+
+    std::ofstream file(path, std::ios::trunc);
+    file << username << '\n';
+    for (int i = 0; i < 32; ++i) {
+        file << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(token[i]);
+    }
+    file << '\n';
+}
+
+void clear_session(const std::string& server_ip) {
+    std::string path = get_session_path(server_ip);
+    if (!path.empty()) {
+        DeleteFileA(path.c_str());
+    }
 }

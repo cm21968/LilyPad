@@ -1,8 +1,14 @@
+#include "auth_db.h"
 #include "chat_persistence.h"
 #include "network.h"
 #include "protocol.h"
+#include "tls_config.h"
+#include "tls_socket.h"
+
+#include <sodium.h>
 
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <condition_variable>
 #include <csignal>
@@ -30,9 +36,10 @@ void signal_handler(int) {
 struct ClientInfo {
     uint32_t           id = 0;
     std::string        username;
-    lilypad::Socket    tcp_socket;
+    lilypad::TlsSocket tls_socket;
     sockaddr_in        udp_addr{};   // filled in when first UDP packet arrives
     bool               udp_known = false;
+    int64_t            db_user_id = 0;
 
     // Voice channel
     bool               in_voice = false;
@@ -46,6 +53,49 @@ struct ClientInfo {
 static std::mutex                                   g_clients_mutex;
 static std::unordered_map<uint32_t, ClientInfo>     g_clients;
 static uint32_t                                     g_next_id = 1;
+
+// ── Auth database ──
+static std::unique_ptr<lilypad::AuthDB> g_auth_db;
+
+// ── TLS ──
+static SSL_CTX* g_ssl_ctx = nullptr;
+
+// ── Rate limiting (per-IP) ──
+struct RateLimitEntry {
+    int      failures = 0;
+    std::chrono::steady_clock::time_point window_start;
+};
+static std::mutex g_rate_limit_mutex;
+static std::unordered_map<std::string, RateLimitEntry> g_rate_limits;
+constexpr int    RATE_LIMIT_MAX_FAILURES = 5;
+constexpr int    RATE_LIMIT_WINDOW_SECS  = 60;
+
+static bool check_rate_limit(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(g_rate_limit_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto& entry = g_rate_limits[ip];
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - entry.window_start).count();
+    if (elapsed >= RATE_LIMIT_WINDOW_SECS) {
+        entry.failures = 0;
+        entry.window_start = now;
+    }
+
+    return entry.failures < RATE_LIMIT_MAX_FAILURES;
+}
+
+static void record_auth_failure(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(g_rate_limit_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto& entry = g_rate_limits[ip];
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - entry.window_start).count();
+    if (elapsed >= RATE_LIMIT_WINDOW_SECS) {
+        entry.failures = 0;
+        entry.window_start = now;
+    }
+    entry.failures++;
+}
 
 // ── Chat history (persistent across restarts via chat_history.jsonl) ──
 struct ChatEntry {
@@ -142,7 +192,7 @@ static void enqueue_relay(std::vector<uint8_t> data, uint32_t sharer_id, bool is
 // ── Broadcast a TCP message to all clients (caller must hold g_clients_mutex) ──
 static void broadcast_tcp(const std::vector<uint8_t>& msg) {
     for (auto& [id, client] : g_clients) {
-        client.tcp_socket.send_all(msg);
+        client.tls_socket.send_all(msg);
     }
 }
 
@@ -160,7 +210,7 @@ static void remove_client(uint32_t client_id) {
             auto voice_left = lilypad::make_voice_left_broadcast(client_id);
             for (auto& [id, c] : g_clients) {
                 if (id != client_id)
-                    c.tcp_socket.send_all(voice_left);
+                    c.tls_socket.send_all(voice_left);
             }
         }
 
@@ -169,7 +219,7 @@ static void remove_client(uint32_t client_id) {
             auto stop_msg = lilypad::make_screen_stop_broadcast(client_id);
             for (auto& [id, c] : g_clients) {
                 if (id != client_id)
-                    c.tcp_socket.send_all(stop_msg);
+                    c.tls_socket.send_all(stop_msg);
             }
         }
 
@@ -178,7 +228,7 @@ static void remove_client(uint32_t client_id) {
             c.screen_subscribers.erase(client_id);
         }
 
-        it->second.tcp_socket.close();
+        it->second.tls_socket.close();
         g_clients.erase(it);
 
         // Broadcast USER_LEFT to remaining clients
@@ -191,7 +241,59 @@ static void remove_client(uint32_t client_id) {
 // ── Per-client read threads (forward declarations for tcp_accept_loop) ──
 static std::mutex               g_client_threads_mutex;
 static std::vector<std::thread> g_client_threads;
-static void client_read_loop(uint32_t id, SOCKET s);
+static void client_read_loop(uint32_t id);
+
+// ── Helper: complete post-auth setup for an authenticated client ──
+// Caller must NOT hold g_clients_mutex. Returns true on success.
+static bool setup_authenticated_client(lilypad::TlsSocket&& tls, const std::string& username,
+                                        int64_t db_user_id, uint32_t& out_client_id) {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    uint32_t client_id = g_next_id++;
+
+    // Send update notification if configured
+    if (!g_update_version.empty() && !g_update_url.empty()) {
+        auto update_msg = lilypad::make_update_available_msg(g_update_version, g_update_url);
+        tls.send_all(update_msg);
+    }
+
+    // Send existing user list
+    for (auto& [id, existing] : g_clients) {
+        auto msg = lilypad::make_user_joined_msg(existing.id, existing.username);
+        tls.send_all(msg);
+    }
+
+    // Send SCREEN_START for any currently-sharing users
+    for (auto& [id, existing] : g_clients) {
+        if (existing.screen_sharing) {
+            auto msg = lilypad::make_screen_start_broadcast(existing.id);
+            tls.send_all(msg);
+        }
+    }
+
+    // Send VOICE_JOINED for any users currently in voice
+    for (auto& [id, existing] : g_clients) {
+        if (existing.in_voice) {
+            auto msg = lilypad::make_voice_joined_broadcast(existing.id);
+            tls.send_all(msg);
+        }
+    }
+
+    // Broadcast USER_JOINED to all existing clients
+    auto joined_msg = lilypad::make_user_joined_msg(client_id, username);
+    broadcast_tcp(joined_msg);
+
+    // Add the new client
+    ClientInfo info;
+    info.id          = client_id;
+    info.username    = username;
+    info.tls_socket  = std::move(tls);
+    info.udp_known   = false;
+    info.db_user_id  = db_user_id;
+    g_clients[client_id] = std::move(info);
+
+    out_client_id = client_id;
+    return true;
+}
 
 // ── Thread 1: Accept new TCP connections ──
 static void tcp_accept_loop(SOCKET listen_sock) {
@@ -218,160 +320,215 @@ static void tcp_accept_loop(SOCKET listen_sock) {
         setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY,
                    reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-        // Large send buffer so relay sends copy to kernel buffer quickly
-        // instead of blocking the relay thread
-        int sndbuf = 1024 * 1024; // 1MB
+        // Large send buffer
+        int sndbuf = 1024 * 1024;
         setsockopt(new_sock, SOL_SOCKET, SO_SNDBUF,
                    reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
 
-        // Large receive buffer so TCP window stays open for big H.264 frames
-        int rcvbuf = 1024 * 1024; // 1MB
+        // Large receive buffer
+        int rcvbuf = 1024 * 1024;
         setsockopt(new_sock, SOL_SOCKET, SO_RCVBUF,
                    reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
-        lilypad::Socket client_tcp(new_sock);
+        lilypad::Socket raw_socket(new_sock);
+        lilypad::TlsSocket tls;
 
-        // Read the signal header (expect JOIN)
-        uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
-        if (!client_tcp.recv_all(hdr_buf, lilypad::SIGNAL_HEADER_SIZE)) {
-            continue; // failed to read header, drop connection
-        }
-
-        auto header = lilypad::deserialize_header(hdr_buf);
-        if (header.type != lilypad::MsgType::JOIN || header.payload_len == 0 ||
-            header.payload_len > lilypad::MAX_USERNAME_LEN + 1) {
-            continue; // invalid first message
-        }
-
-        // Read the username payload
-        std::vector<uint8_t> payload(header.payload_len);
-        if (!client_tcp.recv_all(payload.data(), header.payload_len)) {
+        // TLS handshake
+        if (!tls.accept(std::move(raw_socket), g_ssl_ctx)) {
+            std::cout << "[Server] TLS handshake failed from " << inet_ntoa(client_addr.sin_addr) << "\n";
             continue;
         }
-        std::string username(reinterpret_cast<const char*>(payload.data()));
-        if (username.empty()) username = "Unknown";
 
-        // Assign an ID
-        uint32_t client_id;
-        {
-            std::lock_guard<std::mutex> lock(g_clients_mutex);
-            client_id = g_next_id++;
+        std::string peer_ip = tls.peer_ip();
 
-            // Send WELCOME to the new client
-            auto welcome = lilypad::make_welcome_msg(client_id, UDP_PORT);
-            client_tcp.send_all(welcome);
+        // Auth handshake loop -- client can register then login, or just login
+        bool authenticated = false;
+        uint32_t client_id = 0;
 
-            // Send update notification if configured
-            if (!g_update_version.empty() && !g_update_url.empty()) {
-                auto update_msg = lilypad::make_update_available_msg(
-                    g_update_version, g_update_url);
-                client_tcp.send_all(update_msg);
+        while (g_running && !authenticated) {
+            // Read signal header
+            uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
+            if (!tls.recv_all(hdr_buf, lilypad::SIGNAL_HEADER_SIZE)) {
+                break; // connection lost
             }
 
-            // Send existing user list to the new client
-            for (auto& [id, existing] : g_clients) {
-                auto msg = lilypad::make_user_joined_msg(existing.id, existing.username);
-                client_tcp.send_all(msg);
+            auto header = lilypad::deserialize_header(hdr_buf);
+
+            // Read payload
+            std::vector<uint8_t> payload;
+            if (header.payload_len > 0) {
+                if (header.payload_len > 4096) break; // auth messages should be small
+                payload.resize(header.payload_len);
+                if (!tls.recv_all(payload.data(), header.payload_len)) break;
             }
 
-            // Send SCREEN_START for any currently-sharing users
-            for (auto& [id, existing] : g_clients) {
-                if (existing.screen_sharing) {
-                    auto msg = lilypad::make_screen_start_broadcast(existing.id);
-                    client_tcp.send_all(msg);
+            if (header.type == lilypad::MsgType::AUTH_REGISTER_REQ) {
+                // Parse: username\0 + password\0
+                const char* p = reinterpret_cast<const char*>(payload.data());
+                std::string username(p);
+                size_t pass_offset = username.size() + 1;
+                if (pass_offset >= payload.size()) {
+                    auto resp = lilypad::make_auth_register_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                                  "Invalid request");
+                    tls.send_all(resp);
+                    continue;
                 }
-            }
+                std::string password(reinterpret_cast<const char*>(payload.data() + pass_offset));
 
-            // Send VOICE_JOINED for any users currently in voice
-            for (auto& [id, existing] : g_clients) {
-                if (existing.in_voice) {
-                    auto msg = lilypad::make_voice_joined_broadcast(existing.id);
-                    client_tcp.send_all(msg);
+                // Validate input
+                if (!lilypad::is_valid_username(username)) {
+                    auto resp = lilypad::make_auth_register_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                                  "Username must be 1-32 alphanumeric/underscore characters");
+                    tls.send_all(resp);
+                    continue;
                 }
+                if (!lilypad::is_valid_password(password)) {
+                    auto resp = lilypad::make_auth_register_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                                  "Password must be 8-128 characters");
+                    tls.send_all(resp);
+                    continue;
+                }
+
+                auto result = g_auth_db->register_user(username, password);
+                auto status = result.success ? lilypad::AuthStatus::OK : lilypad::AuthStatus::ERR_USERNAME_TAKEN;
+                auto resp = lilypad::make_auth_register_resp(status, result.message);
+                tls.send_all(resp);
+                // Don't break -- client should now send a login request
+                continue;
+
+            } else if (header.type == lilypad::MsgType::AUTH_LOGIN_REQ) {
+                // Rate limit check
+                if (!check_rate_limit(peer_ip)) {
+                    auto resp = lilypad::make_auth_login_resp(lilypad::AuthStatus::ERR_RATE_LIMITED,
+                                                               0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                               "Too many failed attempts. Try again later.");
+                    tls.send_all(resp);
+                    continue;
+                }
+
+                // Parse: username\0 + password\0
+                const char* p = reinterpret_cast<const char*>(payload.data());
+                std::string username(p);
+                size_t pass_offset = username.size() + 1;
+                if (pass_offset >= payload.size()) {
+                    auto resp = lilypad::make_auth_login_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                               0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                               "Invalid request");
+                    tls.send_all(resp);
+                    continue;
+                }
+                std::string password(reinterpret_cast<const char*>(payload.data() + pass_offset));
+
+                auto result = g_auth_db->verify_login(username, password);
+                if (!result.success) {
+                    record_auth_failure(peer_ip);
+                    auto resp = lilypad::make_auth_login_resp(lilypad::AuthStatus::ERR_INVALID_CREDS,
+                                                               0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                               result.message);
+                    tls.send_all(resp);
+                    continue;
+                }
+
+                // Create session token
+                auto token = g_auth_db->create_session(result.user_id);
+
+                // Setup client
+                if (!setup_authenticated_client(std::move(tls), username, result.user_id, client_id)) {
+                    break;
+                }
+
+                // Send AUTH_LOGIN_RESP (replaces WELCOME)
+                {
+                    std::lock_guard<std::mutex> lock(g_clients_mutex);
+                    auto it = g_clients.find(client_id);
+                    if (it != g_clients.end()) {
+                        auto resp = lilypad::make_auth_login_resp(lilypad::AuthStatus::OK,
+                                                                    client_id, UDP_PORT, token.data(),
+                                                                    "Login successful");
+                        it->second.tls_socket.send_all(resp);
+                    }
+                }
+
+                authenticated = true;
+                std::cout << "[Server] " << username << " (id=" << client_id << ") authenticated.\n";
+
+            } else if (header.type == lilypad::MsgType::AUTH_TOKEN_LOGIN_REQ) {
+                // Rate limit check
+                if (!check_rate_limit(peer_ip)) {
+                    auto resp = lilypad::make_auth_token_login_resp(lilypad::AuthStatus::ERR_RATE_LIMITED,
+                                                                     0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                                     "Too many failed attempts. Try again later.");
+                    tls.send_all(resp);
+                    continue;
+                }
+
+                // Parse: username\0 + token(32)
+                const char* p = reinterpret_cast<const char*>(payload.data());
+                std::string username(p);
+                size_t token_offset = username.size() + 1;
+                if (token_offset + lilypad::SESSION_TOKEN_SIZE > payload.size()) {
+                    auto resp = lilypad::make_auth_token_login_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                                     0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                                     "Invalid request");
+                    tls.send_all(resp);
+                    continue;
+                }
+                const uint8_t* raw_token = payload.data() + token_offset;
+
+                auto result = g_auth_db->validate_token(username, raw_token);
+                if (!result.success) {
+                    record_auth_failure(peer_ip);
+                    auto resp = lilypad::make_auth_token_login_resp(lilypad::AuthStatus::ERR_TOKEN_EXPIRED,
+                                                                     0, 0, std::vector<uint8_t>(32, 0).data(),
+                                                                     result.message);
+                    tls.send_all(resp);
+                    continue;
+                }
+
+                // Setup client
+                if (!setup_authenticated_client(std::move(tls), result.username, result.user_id, client_id)) {
+                    break;
+                }
+
+                // Send AUTH_TOKEN_LOGIN_RESP
+                {
+                    std::lock_guard<std::mutex> lock(g_clients_mutex);
+                    auto it = g_clients.find(client_id);
+                    if (it != g_clients.end()) {
+                        auto resp = lilypad::make_auth_token_login_resp(lilypad::AuthStatus::OK,
+                                                                         client_id, UDP_PORT, result.new_token.data(),
+                                                                         "Token login successful");
+                        it->second.tls_socket.send_all(resp);
+                    }
+                }
+
+                authenticated = true;
+                std::cout << "[Server] " << result.username << " (id=" << client_id << ") token-authenticated.\n";
+
+            } else {
+                // Unknown message type during auth handshake, reject
+                break;
             }
-
-            // Chat history is NOT sent here — client sends CHAT_SYNC after connecting
-
-            // Broadcast USER_JOINED to all existing clients
-            auto joined_msg = lilypad::make_user_joined_msg(client_id, username);
-            broadcast_tcp(joined_msg);
-
-            // Add the new client
-            ClientInfo info;
-            info.id         = client_id;
-            info.username   = username;
-            info.tcp_socket = std::move(client_tcp);
-            info.udp_known  = false;
-            g_clients[client_id] = std::move(info);
         }
 
-        std::cout << "[Server] " << username << " (id=" << client_id << ") joined.\n";
+        if (!authenticated) continue;
 
-        // Spawn a dedicated read thread for this client so one slow sender
-        // can't block frame reception from other clients
+        // Spawn dedicated read thread
         {
             std::lock_guard<std::mutex> lock(g_client_threads_mutex);
-            g_client_threads.emplace_back(client_read_loop, client_id, new_sock);
+            g_client_threads.emplace_back(client_read_loop, client_id);
         }
     }
 }
 
-// ── Non-blocking send helper for video frames ──
-// Attempts to send the full buffer without blocking. Returns true if fully sent,
-// false if the socket would block (frame should be skipped for this subscriber).
-// IMPORTANT: If any bytes were already written to the TCP stream, we MUST finish
-// sending the rest (blocking if needed) to avoid corrupting protocol framing.
-static bool try_send_nonblocking(SOCKET s, const uint8_t* data, size_t len) {
-    // Set non-blocking
-    u_long mode = 1;
-    ioctlsocket(s, FIONBIO, &mode);
-
-    const char* ptr = reinterpret_cast<const char*>(data);
-    int remaining = static_cast<int>(len);
-    int total_sent = 0;
-
-    while (remaining > 0) {
-        int sent = send(s, ptr, remaining, 0);
-        if (sent > 0) {
-            ptr += sent;
-            remaining -= sent;
-            total_sent += sent;
-        } else {
-            int err = WSAGetLastError();
-            if (err == WSAEWOULDBLOCK) {
-                if (total_sent == 0) {
-                    // Nothing sent yet — safe to skip this frame entirely
-                    mode = 0;
-                    ioctlsocket(s, FIONBIO, &mode);
-                    return false;
-                }
-                // Partial data already in the TCP stream — MUST finish to keep
-                // protocol framing intact. Switch to blocking and complete.
-                mode = 0;
-                ioctlsocket(s, FIONBIO, &mode);
-                while (remaining > 0) {
-                    sent = send(s, ptr, remaining, 0);
-                    if (sent <= 0) return false; // real error, connection dead
-                    ptr += sent;
-                    remaining -= sent;
-                }
-                return true;
-            }
-            // Real socket error — connection is likely dead
-            mode = 0;
-            ioctlsocket(s, FIONBIO, &mode);
-            return false;
-        }
-    }
-
-    // Restore blocking mode
-    mode = 0;
-    ioctlsocket(s, FIONBIO, &mode);
-    return true;
+// ── Screen relay thread helper: send with timeout via SO_SNDTIMEO ──
+// TLS doesn't work with non-blocking send approach, so use send timeout instead.
+static bool tls_send_with_timeout(lilypad::TlsSocket& tls, const uint8_t* data, size_t len) {
+    // SO_SNDTIMEO is set on the socket level, SSL_write will respect it
+    return tls.send_all(data, len);
 }
 
 // ── Thread 2: Dedicated screen relay thread ──
-// Drains the relay queue and sends to subscribers. Audio items are sent first.
 static void screen_relay_loop() {
     while (g_running) {
         std::vector<RelayItem> audio_items;
@@ -384,7 +541,6 @@ static void screen_relay_loop() {
             });
             if (!g_running && g_relay_queue.empty()) break;
 
-            // Partition into audio (high priority) and frame (low priority)
             for (auto& item : g_relay_queue) {
                 if (item.is_audio)
                     audio_items.push_back(std::move(item));
@@ -394,62 +550,67 @@ static void screen_relay_loop() {
             g_relay_queue.clear();
         }
 
-        // Helper: collect subscriber sockets for a relay item
-        auto get_subscriber_sockets = [](uint32_t sharer_id) {
-            std::vector<SOCKET> sub_sockets;
+        // Helper: collect subscriber TLS sockets with SO_SNDTIMEO set
+        auto send_to_subscribers = [](uint32_t sharer_id, const uint8_t* data, size_t len, bool set_timeout) {
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             auto it = g_clients.find(sharer_id);
-            if (it != g_clients.end()) {
-                for (uint32_t sub_id : it->second.screen_subscribers) {
-                    auto sub_it = g_clients.find(sub_id);
-                    if (sub_it != g_clients.end()) {
-                        sub_sockets.push_back(sub_it->second.tcp_socket.get());
-                    }
+            if (it == g_clients.end()) return;
+            for (uint32_t sub_id : it->second.screen_subscribers) {
+                auto sub_it = g_clients.find(sub_id);
+                if (sub_it == g_clients.end()) continue;
+
+                if (set_timeout) {
+                    // Set 50ms send timeout for video frames
+                    DWORD timeout_ms = 50;
+                    setsockopt(sub_it->second.tls_socket.get(), SOL_SOCKET, SO_SNDTIMEO,
+                               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+                }
+
+                sub_it->second.tls_socket.send_all(data, len);
+
+                if (set_timeout) {
+                    // Reset send timeout
+                    DWORD timeout_ms = 0;
+                    setsockopt(sub_it->second.tls_socket.get(), SOL_SOCKET, SO_SNDTIMEO,
+                               reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
                 }
             }
-            return sub_sockets;
         };
 
         // Send audio first (high priority) — blocking sends (small packets)
         for (auto& item : audio_items) {
-            auto subs = get_subscriber_sockets(item.sharer_id);
-            for (SOCKET s : subs) {
-                const char* ptr = reinterpret_cast<const char*>(item.data.data());
-                int remaining = static_cast<int>(item.data.size());
-                while (remaining > 0) {
-                    int sent = send(s, ptr, remaining, 0);
-                    if (sent <= 0) break;
-                    ptr += sent;
-                    remaining -= sent;
-                }
-            }
+            send_to_subscribers(item.sharer_id, item.data.data(), item.data.size(), false);
         }
 
-        // For video, only send the NEWEST frame per sharer (drop older ones)
-        // Use non-blocking sends so a slow subscriber doesn't stall others
+        // For video, only send the NEWEST frame per sharer
         {
-            std::unordered_map<uint32_t, size_t> newest; // sharer_id -> index
+            std::unordered_map<uint32_t, size_t> newest;
             for (size_t i = 0; i < frame_items.size(); ++i) {
-                newest[frame_items[i].sharer_id] = i; // last one wins
+                newest[frame_items[i].sharer_id] = i;
             }
             for (auto& [id, idx] : newest) {
                 auto& item = frame_items[idx];
-                auto subs = get_subscriber_sockets(item.sharer_id);
-                for (SOCKET s : subs) {
-                    try_send_nonblocking(s, item.data.data(), item.data.size());
-                }
+                send_to_subscribers(item.sharer_id, item.data.data(), item.data.size(), true);
             }
         }
     }
 }
 
-// ── Per-client read loop — each client gets its own thread so one slow
-//    remote sender can't block frame reception from other clients ──
-static void client_read_loop(uint32_t id, SOCKET s) {
+// ── Per-client read loop ──
+static void client_read_loop(uint32_t id) {
     while (g_running) {
+        SOCKET raw_sock = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it == g_clients.end()) return;
+            raw_sock = it->second.tls_socket.get();
+        }
+        if (raw_sock == INVALID_SOCKET) return;
+
         fd_set read_set;
         FD_ZERO(&read_set);
-        FD_SET(s, &read_set);
+        FD_SET(raw_sock, &read_set);
 
         timeval timeout{};
         timeout.tv_sec  = 0;
@@ -458,31 +619,32 @@ static void client_read_loop(uint32_t id, SOCKET s) {
         int ready = select(0, &read_set, nullptr, nullptr, &timeout);
         if (ready <= 0) continue;
 
-        // Read header
+        // Read header via TLS
         uint8_t hdr_buf[lilypad::SIGNAL_HEADER_SIZE];
         {
-            int total = 0;
-            while (total < static_cast<int>(lilypad::SIGNAL_HEADER_SIZE)) {
-                int r = recv(s, reinterpret_cast<char*>(hdr_buf + total),
-                             static_cast<int>(lilypad::SIGNAL_HEADER_SIZE) - total, 0);
-                if (r <= 0) { remove_client(id); return; }
-                total += r;
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it == g_clients.end()) return;
+            if (!it->second.tls_socket.recv_all(hdr_buf, lilypad::SIGNAL_HEADER_SIZE)) {
+                lock.~lock_guard();
+                remove_client(id);
+                return;
             }
         }
 
         auto header = lilypad::deserialize_header(hdr_buf);
 
-        // Read payload (potentially large for screen frames)
+        // Read payload
         std::vector<uint8_t> payload;
         if (header.payload_len > 0) {
             payload.resize(header.payload_len);
-            int total = 0;
-            int target = static_cast<int>(header.payload_len);
-            while (total < target) {
-                int r = recv(s, reinterpret_cast<char*>(payload.data() + total),
-                             target - total, 0);
-                if (r <= 0) { remove_client(id); return; }
-                total += r;
+            std::lock_guard<std::mutex> lock(g_clients_mutex);
+            auto it = g_clients.find(id);
+            if (it == g_clients.end()) return;
+            if (!it->second.tls_socket.recv_all(payload.data(), header.payload_len)) {
+                lock.~lock_guard();
+                remove_client(id);
+                return;
             }
         }
 
@@ -541,7 +703,7 @@ static void client_read_loop(uint32_t id, SOCKET s) {
                     std::lock_guard<std::mutex> lock(g_clients_mutex);
                     auto cit = g_clients.find(id);
                     if (cit != g_clients.end()) {
-                        cit->second.tcp_socket.send_all(msg);
+                        cit->second.tls_socket.send_all(msg);
                     }
                 }
             }
@@ -572,10 +734,10 @@ static void client_read_loop(uint32_t id, SOCKET s) {
                 auto sub_it = g_clients.find(id);
                 if (sub_it != g_clients.end()) {
                     if (!it->second.cached_keyframe.empty()) {
-                        sub_it->second.tcp_socket.send_all(it->second.cached_keyframe);
+                        sub_it->second.tls_socket.send_all(it->second.cached_keyframe);
                     } else {
                         auto req = lilypad::make_screen_request_keyframe_msg();
-                        it->second.tcp_socket.send_all(req);
+                        it->second.tls_socket.send_all(req);
                     }
                 }
             }
@@ -609,6 +771,74 @@ static void client_read_loop(uint32_t id, SOCKET s) {
         } else if (header.type == lilypad::MsgType::SCREEN_AUDIO && !payload.empty()) {
             auto relay = lilypad::make_screen_audio_relay(id, payload.data(), payload.size());
             enqueue_relay(std::move(relay), id, true);
+        } else if (header.type == lilypad::MsgType::AUTH_CHANGE_PASS_REQ) {
+            // Parse: old_password\0 + new_password\0
+            const char* p = reinterpret_cast<const char*>(payload.data());
+            std::string old_pass(p);
+            size_t new_offset = old_pass.size() + 1;
+            std::string new_pass;
+            if (new_offset < payload.size()) {
+                new_pass = std::string(reinterpret_cast<const char*>(payload.data() + new_offset));
+            }
+
+            int64_t db_user_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) db_user_id = it->second.db_user_id;
+            }
+
+            if (!lilypad::is_valid_password(new_pass)) {
+                auto resp = lilypad::make_auth_change_pass_resp(lilypad::AuthStatus::ERR_INVALID_INPUT,
+                                                                 "Password must be 8-128 characters");
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) it->second.tls_socket.send_all(resp);
+            } else {
+                auto result = g_auth_db->change_password(db_user_id, old_pass, new_pass);
+                auto status = result.success ? lilypad::AuthStatus::OK : lilypad::AuthStatus::ERR_INVALID_CREDS;
+                auto resp = lilypad::make_auth_change_pass_resp(status, result.message);
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) it->second.tls_socket.send_all(resp);
+            }
+        } else if (header.type == lilypad::MsgType::AUTH_DELETE_ACCT_REQ) {
+            const char* p = reinterpret_cast<const char*>(payload.data());
+            std::string password(p);
+
+            int64_t db_user_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) db_user_id = it->second.db_user_id;
+            }
+
+            auto result = g_auth_db->delete_account(db_user_id, password);
+            auto status = result.success ? lilypad::AuthStatus::OK : lilypad::AuthStatus::ERR_INVALID_CREDS;
+            auto resp = lilypad::make_auth_delete_acct_resp(status, result.message);
+            {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) it->second.tls_socket.send_all(resp);
+            }
+
+            if (result.success) {
+                remove_client(id);
+                return;
+            }
+        } else if (header.type == lilypad::MsgType::AUTH_LOGOUT) {
+            // Invalidate all sessions for this user
+            int64_t db_user_id = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_clients_mutex);
+                auto it = g_clients.find(id);
+                if (it != g_clients.end()) db_user_id = it->second.db_user_id;
+            }
+            if (db_user_id > 0) {
+                g_auth_db->invalidate_all_sessions(db_user_id);
+            }
+            remove_client(id);
+            return;
         }
     }
 }
@@ -653,8 +883,8 @@ static void udp_relay_loop(SOCKET udp_sock) {
             if (!it->second.in_voice) continue;
 
             // Forward to all other clients with known UDP addresses that are in voice
-            for (auto& [id, client] : g_clients) {
-                if (id == sender_id || !client.udp_known || !client.in_voice) continue;
+            for (auto& [cid, client] : g_clients) {
+                if (cid == sender_id || !client.udp_known || !client.in_voice) continue;
                 sendto(udp_sock, reinterpret_cast<const char*>(buf), received, 0,
                        reinterpret_cast<const sockaddr*>(&client.udp_addr),
                        sizeof(client.udp_addr));
@@ -663,18 +893,61 @@ static void udp_relay_loop(SOCKET udp_sock) {
     }
 }
 
-int main() {
+// ── Session cleanup thread ──
+static void session_cleanup_loop() {
+    while (g_running) {
+        // Sleep for 1 hour, checking g_running every second
+        for (int i = 0; i < 3600 && g_running; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (!g_running) break;
+        g_auth_db->cleanup_expired_sessions();
+    }
+}
+
+int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
+
+    // Parse CLI args
+    std::string cert_path = "server.crt";
+    std::string key_path  = "server.key";
+    for (int i = 1; i < argc; ++i) {
+        std::string arg(argv[i]);
+        if (arg == "--cert" && i + 1 < argc) cert_path = argv[++i];
+        else if (arg == "--key" && i + 1 < argc) key_path = argv[++i];
+    }
+
     load_update_config();
     load_chat_history();
 
     try {
         lilypad::WinsockInit winsock;
+        lilypad::OpenSSLInit openssl;
+
+        // Initialize libsodium
+        if (sodium_init() < 0) {
+            std::cerr << "Failed to initialize libsodium\n";
+            return 1;
+        }
+
+        // Initialize auth database
+        g_auth_db = std::make_unique<lilypad::AuthDB>("lilypad.db");
+        g_auth_db->cleanup_expired_sessions();
+
+        // Load or generate TLS certificate
+        if (!lilypad::load_or_generate_cert(cert_path, key_path)) {
+            std::cerr << "Failed to load/generate TLS certificate\n";
+            return 1;
+        }
+        g_ssl_ctx = lilypad::create_server_ssl_ctx(cert_path, key_path);
+        if (!g_ssl_ctx) {
+            std::cerr << "Failed to create SSL context\n";
+            return 1;
+        }
 
         // ── Create and bind TCP listen socket ──
         auto tcp_listen = lilypad::create_tcp_socket();
 
-        // Allow address reuse
         int opt = 1;
         setsockopt(tcp_listen.get(), SOL_SOCKET, SO_REUSEADDR,
                    reinterpret_cast<const char*>(&opt), sizeof(opt));
@@ -710,17 +983,18 @@ int main() {
         }
 
         std::cout << "Listening on TCP port " << TCP_PORT
-                  << ", UDP port " << UDP_PORT << "\n";
+                  << ", UDP port " << UDP_PORT << " (TLS enabled)\n";
 
         // ── Launch threads ──
         std::thread tcp_accept_thread(tcp_accept_loop, tcp_listen.get());
         std::thread udp_relay_thread(udp_relay_loop, udp_sock.get());
         std::thread screen_relay_thread(screen_relay_loop);
+        std::thread cleanup_thread(session_cleanup_loop);
 
         // Wait for Ctrl+C
         tcp_accept_thread.join();
 
-        // Join all per-client read threads (they exit when g_running is false)
+        // Join all per-client read threads
         {
             std::lock_guard<std::mutex> lock(g_client_threads_mutex);
             for (auto& t : g_client_threads) {
@@ -731,6 +1005,10 @@ int main() {
         udp_relay_thread.join();
         g_relay_cv.notify_all();
         screen_relay_thread.join();
+        cleanup_thread.join();
+
+        if (g_ssl_ctx) SSL_CTX_free(g_ssl_ctx);
+        g_auth_db.reset();
 
         std::cout << "[Server] Shutting down.\n";
 

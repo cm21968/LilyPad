@@ -1,4 +1,5 @@
 #include "network_threads.h"
+#include "connection.h"
 #include "persistence.h"
 #include "chat_persistence.h"
 
@@ -211,6 +212,42 @@ void tcp_receive_thread(AppState& app) {
                         app.update_url     = url;
                         app.update_available = true;
                     }
+                }
+            }
+            break;
+        }
+        case lilypad::MsgType::AUTH_CHANGE_PASS_RESP: {
+            if (payload.size() >= 2) {
+                auto status = static_cast<lilypad::AuthStatus>(payload[0]);
+                const char* msg = reinterpret_cast<const char*>(payload.data() + 1);
+                if (status == lilypad::AuthStatus::OK) {
+                    app.add_system_msg(std::string("Password changed: ") + msg);
+                    // Clear saved session since all sessions were invalidated
+                    clear_session(app.server_ip);
+                } else {
+                    app.add_system_msg(std::string("Password change failed: ") + msg);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                    app.auth_error = (status == lilypad::AuthStatus::OK) ? "" : std::string(msg);
+                }
+            }
+            break;
+        }
+        case lilypad::MsgType::AUTH_DELETE_ACCT_RESP: {
+            if (payload.size() >= 2) {
+                auto status = static_cast<lilypad::AuthStatus>(payload[0]);
+                const char* msg = reinterpret_cast<const char*>(payload.data() + 1);
+                if (status == lilypad::AuthStatus::OK) {
+                    app.add_system_msg("Account deleted.");
+                    clear_session(app.server_ip);
+                    app.connected = false;
+                } else {
+                    app.add_system_msg(std::string("Delete account failed: ") + msg);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                    app.auth_error = (status == lilypad::AuthStatus::OK) ? "" : std::string(msg);
                 }
             }
             break;

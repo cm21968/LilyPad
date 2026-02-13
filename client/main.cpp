@@ -8,6 +8,7 @@
 #include "persistence.h"
 #include "screen_threads.h"
 #include "theme.h"
+#include "tls_socket.h"
 #include "update_checker.h"
 
 #include <imgui.h>
@@ -84,8 +85,8 @@ static LRESULT WINAPI WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return TRUE;
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-        mmi->ptMinTrackSize.x = 700;
-        mmi->ptMinTrackSize.y = 450;
+        mmi->ptMinTrackSize.x = 1280;
+        mmi->ptMinTrackSize.y = 720;
         return 0;
     }
     case WM_SIZE:
@@ -107,6 +108,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
     (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION);
     lilypad::WinsockInit winsock;
+    lilypad::OpenSSLInit openssl;
     lilypad::PortAudioInit pa;
 
     WNDCLASSEX wc = {};
@@ -158,6 +160,14 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
     char ip_buf[64]       = "127.0.0.1";
     char username_buf[64] = "";
     char chat_input[512]  = "";
+    char password_buf[128]   = "";
+    char confirm_buf[128]    = "";
+    char old_pass_buf[128]   = "";
+    char new_pass_buf[128]   = "";
+    char delete_pass_buf[128] = "";
+    bool remember_me = true;
+    bool show_login_tab = true;  // true = Login tab, false = Register tab
+    bool trust_self_signed = false;
 
     auto input_devices  = lilypad::get_input_devices();
     auto output_devices = lilypad::get_output_devices();
@@ -205,6 +215,9 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         auto_connect_pending = true;
     }
 
+    // Apply trust-self-signed from settings
+    app.trust_self_signed = trust_self_signed;
+
     // ── Main loop ──
     ImVec4 clear_color = ImVec4(0.06f, 0.06f, 0.08f, 1.00f);
     bool running = true;
@@ -222,8 +235,15 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         // Auto-connect to last server on first frame
         if (auto_connect_pending) {
             auto_connect_pending = false;
-            if (!settings.last_username.empty()) {
-                do_connect(app, ip_buf, username_buf);
+            do_tls_connect(app, ip_buf);
+            if (app.auth_state.load() == AuthState::CONNECTED_UNAUTH) {
+                // Try saved session token
+                auto saved = load_session(ip_buf);
+                if (saved.valid) {
+                    strncpy(username_buf, saved.username.c_str(), sizeof(username_buf) - 1);
+                    username_buf[sizeof(username_buf) - 1] = '\0';
+                    do_token_login(app, saved.username, saved.token.data());
+                }
             }
         }
 
@@ -509,6 +529,60 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
 
             ImGui::Spacing();
 
+            // ── Account section (only when authenticated) ──
+            if (app.auth_state.load() == AuthState::AUTHENTICATED) {
+                ImGui::Spacing();
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "Account");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Show auth error
+                {
+                    std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                    if (!app.auth_error.empty()) {
+                        ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", app.auth_error.c_str());
+                        ImGui::Spacing();
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Change Password")) {
+                    ImGui::Text("Current Password");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##old_pass", old_pass_buf, sizeof(old_pass_buf),
+                                     ImGuiInputTextFlags_Password);
+                    ImGui::Text("New Password");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##new_pass", new_pass_buf, sizeof(new_pass_buf),
+                                     ImGuiInputTextFlags_Password);
+                    ImGui::Spacing();
+                    if (ImGui::Button("Change Password", ImVec2(-1, 0))) {
+                        do_change_password(app, old_pass_buf, new_pass_buf);
+                        old_pass_buf[0] = '\0';
+                        new_pass_buf[0] = '\0';
+                    }
+                }
+
+                if (ImGui::CollapsingHeader("Delete Account")) {
+                    ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "This cannot be undone!");
+                    ImGui::Text("Confirm Password");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##del_pass", delete_pass_buf, sizeof(delete_pass_buf),
+                                     ImGuiInputTextFlags_Password);
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+                    if (ImGui::Button("Delete Account", ImVec2(-1, 0))) {
+                        do_delete_account(app, delete_pass_buf);
+                        delete_pass_buf[0] = '\0';
+                    }
+                    ImGui::PopStyleColor(3);
+                }
+            }
+
+            ImGui::Spacing();
+
             // Close when clicking outside the popup
             if (!ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows) &&
                 ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -525,9 +599,10 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         }
 
         bool is_connected = app.connected.load();
+        auto auth_state = app.auth_state.load();
 
         // ════════════════════════════════════════
-        //  Left panel: Connection / Users / Settings
+        //  Left panel: Connection / Auth / Users
         // ════════════════════════════════════════
         float panel_width = 260.0f;
         ImGui::BeginChild("##LeftPanel", ImVec2(panel_width, 0), true);
@@ -536,7 +611,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         ImGui::Separator();
         ImGui::Spacing();
 
-        if (!is_connected) {
+        if (auth_state == AuthState::DISCONNECTED) {
+            // ── DISCONNECTED: Server IP + favorites + Connect ──
             ImGui::Text("Server IP");
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##ip", ip_buf, sizeof(ip_buf));
@@ -547,12 +623,10 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             ImGui::Separator();
             ImGui::Spacing();
 
-            // Favorite server buttons -- click to connect, X to remove
             int fav_to_remove = -1;
             for (int i = 0; i < static_cast<int>(favorites.size()); ++i) {
                 ImGui::PushID(i);
 
-                // X remove button (small, red)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.50f, 0.18f, 0.18f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
@@ -563,32 +637,31 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
 
                 ImGui::SameLine();
 
-                // Connect button (full width, green)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
                 if (ImGui::Button(favorites[i].name.c_str(), ImVec2(-1, 0))) {
-                    // Fill fields and connect
                     strncpy(ip_buf, favorites[i].ip.c_str(), sizeof(ip_buf) - 1);
                     ip_buf[sizeof(ip_buf) - 1] = '\0';
-                    if (!favorites[i].username.empty()) {
-                        strncpy(username_buf, favorites[i].username.c_str(), sizeof(username_buf) - 1);
-                        username_buf[sizeof(username_buf) - 1] = '\0';
-                    }
-                    app.ptt_enabled = ptt_enabled;
-                    app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
-                    app.noise_suppression = noise_suppression;
-                    do_connect(app, favorites[i].ip, favorites[i].username.empty() ? std::string(username_buf) : favorites[i].username);
+                    app.trust_self_signed = trust_self_signed;
+                    do_tls_connect(app, favorites[i].ip);
 
-                    if (app.connected.load()) {
-                        settings.last_server_ip = ip_buf;
-                        settings.last_username = username_buf;
-                        save_settings(settings);
+                    if (app.auth_state.load() == AuthState::CONNECTED_UNAUTH) {
+                        auto saved = load_session(favorites[i].ip);
+                        if (saved.valid) {
+                            strncpy(username_buf, saved.username.c_str(), sizeof(username_buf) - 1);
+                            username_buf[sizeof(username_buf) - 1] = '\0';
+                            do_token_login(app, saved.username, saved.token.data());
+                        }
+                        if (app.connected.load()) {
+                            settings.last_server_ip = ip_buf;
+                            settings.last_username = username_buf;
+                            save_settings(settings);
+                        }
                     }
                 }
                 ImGui::PopStyleColor(3);
 
-                // Tooltip with IP on hover
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("%s", favorites[i].ip.c_str());
                 }
@@ -601,7 +674,6 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
                 save_favorites(favorites);
             }
 
-            // Save current IP to favorites
             ImGui::Spacing();
             ImGui::Text("Name");
             ImGui::SetNextItemWidth(-1);
@@ -622,14 +694,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             ImGui::Spacing();
             ImGui::Spacing();
 
-            ImGui::Text("Username");
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##user", username_buf, sizeof(username_buf));
-
-            ImGui::Spacing();
-            ImGui::Spacing();
-
-            // Update available button (pre-connection)
+            // Update available
             if (app.update_available.load()) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.55f, 0.15f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.68f, 0.20f, 1.0f));
@@ -647,30 +712,154 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
                 ImGui::Spacing();
             }
 
-            // Auto-connect toggle
             if (ImGui::Checkbox("Auto-connect to last server", &auto_connect)) {
                 settings.auto_connect = auto_connect;
                 save_settings(settings);
             }
 
+            if (ImGui::Checkbox("Trust self-signed certificates", &trust_self_signed)) {
+                app.trust_self_signed = trust_self_signed;
+            }
+
             ImGui::Spacing();
 
-            // Connect button
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
             if (ImGui::Button("Connect", ImVec2(-1, 36))) {
-                app.ptt_enabled = ptt_enabled;
-                app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
-                app.noise_suppression = noise_suppression;
-                do_connect(app, ip_buf, username_buf);
+                app.trust_self_signed = trust_self_signed;
+                do_tls_connect(app, ip_buf);
 
-                // Save last server for auto-connect
-                if (app.connected.load()) {
-                    settings.last_server_ip = ip_buf;
-                    settings.last_username = username_buf;
-                    save_settings(settings);
+                // Try saved session token for auto-login
+                if (app.auth_state.load() == AuthState::CONNECTED_UNAUTH) {
+                    auto saved = load_session(ip_buf);
+                    if (saved.valid) {
+                        strncpy(username_buf, saved.username.c_str(), sizeof(username_buf) - 1);
+                        username_buf[sizeof(username_buf) - 1] = '\0';
+                        do_token_login(app, saved.username, saved.token.data());
+                    }
+                    if (app.connected.load()) {
+                        settings.last_server_ip = ip_buf;
+                        settings.last_username = username_buf;
+                        save_settings(settings);
+                    }
                 }
+            }
+            ImGui::PopStyleColor(3);
+
+        } else if (auth_state == AuthState::CONNECTED_UNAUTH ||
+                   auth_state == AuthState::LOGGING_IN ||
+                   auth_state == AuthState::REGISTERING) {
+            // ── CONNECTED_UNAUTH: Login / Register tabs ──
+            ImGui::TextColored(ImVec4(0.33f, 0.72f, 0.48f, 1.0f), "TLS Connected");
+            ImGui::Text("Server: %s", ip_buf);
+            ImGui::Spacing();
+
+            // Show auth error if any
+            {
+                std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                if (!app.auth_error.empty()) {
+                    ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", app.auth_error.c_str());
+                    ImGui::Spacing();
+                }
+            }
+
+            // Login / Register tabs
+            if (ImGui::BeginTabBar("##AuthTabs")) {
+                if (ImGui::BeginTabItem("Login")) {
+                    show_login_tab = true;
+                    ImGui::Spacing();
+                    ImGui::Text("Username");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##login_user", username_buf, sizeof(username_buf));
+
+                    ImGui::Text("Password");
+                    ImGui::SetNextItemWidth(-1);
+                    bool enter_login = ImGui::InputText("##login_pass", password_buf, sizeof(password_buf),
+                                                          ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+
+                    ImGui::Checkbox("Remember me", &remember_me);
+                    ImGui::Spacing();
+
+                    bool do_login_now = enter_login;
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
+                    if (ImGui::Button("Login", ImVec2(-1, 30)) || do_login_now) {
+                        if (auth_state == AuthState::CONNECTED_UNAUTH) {
+                            {
+                                std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                                app.auth_error.clear();
+                            }
+                            app.ptt_enabled = ptt_enabled;
+                            app.ptt_key     = g_ptt_keys[ptt_key_sel].vk;
+                            app.noise_suppression = noise_suppression;
+                            do_login(app, username_buf, password_buf, remember_me);
+                            if (app.connected.load()) {
+                                settings.last_server_ip = ip_buf;
+                                settings.last_username = username_buf;
+                                save_settings(settings);
+                                password_buf[0] = '\0';
+                            }
+                        }
+                    }
+                    ImGui::PopStyleColor(3);
+
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Register")) {
+                    show_login_tab = false;
+                    ImGui::Spacing();
+                    ImGui::Text("Username");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##reg_user", username_buf, sizeof(username_buf));
+
+                    ImGui::Text("Password");
+                    ImGui::SetNextItemWidth(-1);
+                    ImGui::InputText("##reg_pass", password_buf, sizeof(password_buf),
+                                     ImGuiInputTextFlags_Password);
+
+                    ImGui::Text("Confirm Password");
+                    ImGui::SetNextItemWidth(-1);
+                    bool enter_reg = ImGui::InputText("##reg_confirm", confirm_buf, sizeof(confirm_buf),
+                                                       ImGuiInputTextFlags_Password | ImGuiInputTextFlags_EnterReturnsTrue);
+
+                    ImGui::Spacing();
+
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.55f, 0.38f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.33f, 0.72f, 0.48f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.40f, 0.82f, 0.55f, 1.0f));
+                    if (ImGui::Button("Register", ImVec2(-1, 30)) || enter_reg) {
+                        if (auth_state == AuthState::CONNECTED_UNAUTH) {
+                            if (std::string(password_buf) != std::string(confirm_buf)) {
+                                std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                                app.auth_error = "Passwords do not match";
+                            } else {
+                                {
+                                    std::lock_guard<std::mutex> lk(app.auth_error_mutex);
+                                    app.auth_error.clear();
+                                }
+                                do_register(app, username_buf, password_buf);
+                                confirm_buf[0] = '\0';
+                            }
+                        }
+                    }
+                    ImGui::PopStyleColor(3);
+
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            // Disconnect button
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
+            if (ImGui::Button("Disconnect", ImVec2(-1, 36))) {
+                do_disconnect(app);
             }
             ImGui::PopStyleColor(3);
 
@@ -934,12 +1123,12 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
             ImGui::Spacing();
             ImGui::Spacing();
 
-            // Disconnect
+            // Logout / Disconnect
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.22f, 0.22f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.28f, 0.28f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.82f, 0.33f, 0.33f, 1.0f));
-            if (ImGui::Button("Disconnect", ImVec2(-1, 36))) {
-                do_disconnect(app);
+            if (ImGui::Button("Logout", ImVec2(-1, 36))) {
+                do_logout(app);
             }
             ImGui::PopStyleColor(3);
         }

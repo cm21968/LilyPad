@@ -38,6 +38,29 @@ enum class MsgType : uint8_t {
     CHAT_SYNC      = 0x12,  // Client→Server: last_known_seq(8)
 
     SCREEN_REQUEST_KEYFRAME = 0x13,  // Server→Client: empty payload (request IDR)
+
+    // Authentication
+    AUTH_REGISTER_REQ     = 0x20,  // C->S: username\0 + password\0
+    AUTH_REGISTER_RESP    = 0x21,  // S->C: status(1) + message\0
+    AUTH_LOGIN_REQ        = 0x22,  // C->S: username\0 + password\0
+    AUTH_LOGIN_RESP       = 0x23,  // S->C: status(1) + client_id(4) + udp_port(2) + token(32) + message\0
+    AUTH_TOKEN_LOGIN_REQ  = 0x24,  // C->S: username\0 + token(32)
+    AUTH_TOKEN_LOGIN_RESP = 0x25,  // S->C: same as AUTH_LOGIN_RESP
+    AUTH_CHANGE_PASS_REQ  = 0x26,  // C->S: old_password\0 + new_password\0
+    AUTH_CHANGE_PASS_RESP = 0x27,  // S->C: status(1) + message\0
+    AUTH_DELETE_ACCT_REQ  = 0x28,  // C->S: password\0
+    AUTH_DELETE_ACCT_RESP = 0x29,  // S->C: status(1) + message\0
+    AUTH_LOGOUT           = 0x2A,  // C->S: empty
+};
+
+enum class AuthStatus : uint8_t {
+    OK                 = 0x00,
+    ERR_USERNAME_TAKEN = 0x01,
+    ERR_INVALID_CREDS  = 0x02,
+    ERR_TOKEN_EXPIRED  = 0x03,
+    ERR_RATE_LIMITED   = 0x04,
+    ERR_INVALID_INPUT  = 0x05,
+    ERR_INTERNAL       = 0x06,
 };
 
 // ── TCP signal header: [msg_type:1][payload_len:4] = 5 bytes ──
@@ -427,6 +450,160 @@ inline std::vector<uint8_t> make_update_available_msg(const std::string& version
     buf.insert(buf.end(), url.begin(), url.end());
     buf.push_back('\0');
     return buf;
+}
+
+// ── Authentication message helpers ──
+
+constexpr size_t SESSION_TOKEN_SIZE = 32;
+constexpr size_t MAX_PASSWORD_LEN   = 128;
+constexpr size_t MIN_PASSWORD_LEN   = 8;
+
+// C->S: username\0 + password\0
+inline std::vector<uint8_t> make_auth_register_req(const std::string& username, const std::string& password) {
+    std::string name = username.substr(0, MAX_USERNAME_LEN);
+    std::string pass = password.substr(0, MAX_PASSWORD_LEN);
+    uint32_t len = static_cast<uint32_t>(name.size() + 1 + pass.size() + 1);
+    SignalHeader h{MsgType::AUTH_REGISTER_REQ, len};
+    auto buf = serialize_header(h);
+    buf.insert(buf.end(), name.begin(), name.end());
+    buf.push_back('\0');
+    buf.insert(buf.end(), pass.begin(), pass.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// S->C: status(1) + message\0
+inline std::vector<uint8_t> make_auth_register_resp(AuthStatus status, const std::string& message) {
+    uint32_t len = static_cast<uint32_t>(1 + message.size() + 1);
+    SignalHeader h{MsgType::AUTH_REGISTER_RESP, len};
+    auto buf = serialize_header(h);
+    buf.push_back(static_cast<uint8_t>(status));
+    buf.insert(buf.end(), message.begin(), message.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// C->S: username\0 + password\0
+inline std::vector<uint8_t> make_auth_login_req(const std::string& username, const std::string& password) {
+    std::string name = username.substr(0, MAX_USERNAME_LEN);
+    std::string pass = password.substr(0, MAX_PASSWORD_LEN);
+    uint32_t len = static_cast<uint32_t>(name.size() + 1 + pass.size() + 1);
+    SignalHeader h{MsgType::AUTH_LOGIN_REQ, len};
+    auto buf = serialize_header(h);
+    buf.insert(buf.end(), name.begin(), name.end());
+    buf.push_back('\0');
+    buf.insert(buf.end(), pass.begin(), pass.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// S->C: status(1) + client_id(4) + udp_port(2) + token(32) + message\0
+inline std::vector<uint8_t> make_auth_login_resp(AuthStatus status, uint32_t client_id,
+                                                  uint16_t udp_port, const uint8_t* token,
+                                                  const std::string& message) {
+    uint32_t len = static_cast<uint32_t>(1 + 4 + 2 + SESSION_TOKEN_SIZE + message.size() + 1);
+    SignalHeader h{MsgType::AUTH_LOGIN_RESP, len};
+    auto buf = serialize_header(h);
+    buf.push_back(static_cast<uint8_t>(status));
+    write_u32(buf, client_id);
+    buf.push_back(static_cast<uint8_t>(udp_port & 0xFF));
+    buf.push_back(static_cast<uint8_t>((udp_port >> 8) & 0xFF));
+    buf.insert(buf.end(), token, token + SESSION_TOKEN_SIZE);
+    buf.insert(buf.end(), message.begin(), message.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// C->S: username\0 + token(32)
+inline std::vector<uint8_t> make_auth_token_login_req(const std::string& username, const uint8_t* token) {
+    std::string name = username.substr(0, MAX_USERNAME_LEN);
+    uint32_t len = static_cast<uint32_t>(name.size() + 1 + SESSION_TOKEN_SIZE);
+    SignalHeader h{MsgType::AUTH_TOKEN_LOGIN_REQ, len};
+    auto buf = serialize_header(h);
+    buf.insert(buf.end(), name.begin(), name.end());
+    buf.push_back('\0');
+    buf.insert(buf.end(), token, token + SESSION_TOKEN_SIZE);
+    return buf;
+}
+
+// S->C: same format as AUTH_LOGIN_RESP
+inline std::vector<uint8_t> make_auth_token_login_resp(AuthStatus status, uint32_t client_id,
+                                                        uint16_t udp_port, const uint8_t* token,
+                                                        const std::string& message) {
+    uint32_t len = static_cast<uint32_t>(1 + 4 + 2 + SESSION_TOKEN_SIZE + message.size() + 1);
+    SignalHeader h{MsgType::AUTH_TOKEN_LOGIN_RESP, len};
+    auto buf = serialize_header(h);
+    buf.push_back(static_cast<uint8_t>(status));
+    write_u32(buf, client_id);
+    buf.push_back(static_cast<uint8_t>(udp_port & 0xFF));
+    buf.push_back(static_cast<uint8_t>((udp_port >> 8) & 0xFF));
+    buf.insert(buf.end(), token, token + SESSION_TOKEN_SIZE);
+    buf.insert(buf.end(), message.begin(), message.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// C->S: old_password\0 + new_password\0
+inline std::vector<uint8_t> make_auth_change_pass_req(const std::string& old_pass, const std::string& new_pass) {
+    uint32_t len = static_cast<uint32_t>(old_pass.size() + 1 + new_pass.size() + 1);
+    SignalHeader h{MsgType::AUTH_CHANGE_PASS_REQ, len};
+    auto buf = serialize_header(h);
+    buf.insert(buf.end(), old_pass.begin(), old_pass.end());
+    buf.push_back('\0');
+    buf.insert(buf.end(), new_pass.begin(), new_pass.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// S->C: status(1) + message\0
+inline std::vector<uint8_t> make_auth_change_pass_resp(AuthStatus status, const std::string& message) {
+    uint32_t len = static_cast<uint32_t>(1 + message.size() + 1);
+    SignalHeader h{MsgType::AUTH_CHANGE_PASS_RESP, len};
+    auto buf = serialize_header(h);
+    buf.push_back(static_cast<uint8_t>(status));
+    buf.insert(buf.end(), message.begin(), message.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// C->S: password\0
+inline std::vector<uint8_t> make_auth_delete_acct_req(const std::string& password) {
+    uint32_t len = static_cast<uint32_t>(password.size() + 1);
+    SignalHeader h{MsgType::AUTH_DELETE_ACCT_REQ, len};
+    auto buf = serialize_header(h);
+    buf.insert(buf.end(), password.begin(), password.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// S->C: status(1) + message\0
+inline std::vector<uint8_t> make_auth_delete_acct_resp(AuthStatus status, const std::string& message) {
+    uint32_t len = static_cast<uint32_t>(1 + message.size() + 1);
+    SignalHeader h{MsgType::AUTH_DELETE_ACCT_RESP, len};
+    auto buf = serialize_header(h);
+    buf.push_back(static_cast<uint8_t>(status));
+    buf.insert(buf.end(), message.begin(), message.end());
+    buf.push_back('\0');
+    return buf;
+}
+
+// C->S: empty
+inline std::vector<uint8_t> make_auth_logout_msg() {
+    SignalHeader h{MsgType::AUTH_LOGOUT, 0};
+    return serialize_header(h);
+}
+
+// Input validation helpers
+inline bool is_valid_username(const std::string& username) {
+    if (username.empty() || username.size() > MAX_USERNAME_LEN) return false;
+    for (char c : username) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') return false;
+    }
+    return true;
+}
+
+inline bool is_valid_password(const std::string& password) {
+    return password.size() >= MIN_PASSWORD_LEN && password.size() <= MAX_PASSWORD_LEN;
 }
 
 } // namespace lilypad

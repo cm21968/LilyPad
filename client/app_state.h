@@ -8,6 +8,7 @@
 #include "audio_codec.h"
 #include "network.h"
 #include "protocol.h"
+#include "tls_socket.h"
 
 #include <d3d11.h>
 #include <windows.h>
@@ -24,7 +25,7 @@
 #include <vector>
 
 // ── App version (compared against server's update notification) ──
-static constexpr const char* APP_VERSION = "1.0.6";
+static constexpr const char* APP_VERSION = "1.0.7";
 
 // ── GitHub update check URL (raw version.txt: line 1 = version, line 2 = download URL) ──
 static constexpr const char* UPDATE_CHECK_URL = "https://raw.githubusercontent.com/cm21968/LilyPad/main/version.txt";
@@ -39,6 +40,17 @@ inline bool is_newer_version(const char* local, const std::string& remote) {
     if (r_minor != l_minor) return r_minor > l_minor;
     return r_patch > l_patch;
 }
+
+// ════════════════════════════════════════════════════════════════
+//  Authentication state
+// ════════════════════════════════════════════════════════════════
+enum class AuthState {
+    DISCONNECTED,
+    CONNECTED_UNAUTH,  // TLS connected, not yet authenticated
+    LOGGING_IN,
+    REGISTERING,
+    AUTHENTICATED,
+};
 
 // ════════════════════════════════════════════════════════════════
 //  Server favorites
@@ -102,6 +114,13 @@ struct AppState {
     std::string       my_username;
     std::string       server_ip;
 
+    // Authentication
+    std::atomic<AuthState> auth_state{AuthState::DISCONNECTED};
+    std::vector<uint8_t>   session_token; // 32 bytes, raw
+    std::mutex             auth_error_mutex;
+    std::string            auth_error;
+    bool                   trust_self_signed = false;
+
     // Voice channel (separate from text chat)
     std::atomic<bool> in_voice{false};
 
@@ -112,9 +131,9 @@ struct AppState {
     std::atomic<bool>       update_available{false};
 
     // Network handles
-    std::unique_ptr<lilypad::Socket> tcp;
-    std::unique_ptr<lilypad::Socket> udp;
-    sockaddr_in                      udp_dest{};
+    std::unique_ptr<lilypad::TlsSocket> tcp;
+    std::unique_ptr<lilypad::Socket>    udp;
+    sockaddr_in                         udp_dest{};
 
     // User list
     std::mutex              users_mutex;
